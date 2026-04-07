@@ -66,7 +66,7 @@ Traditional parking systems assign bays on a first-come-first-served basis. Our 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        STREAMLIT WEB UI                              │
+│                        STREAMLIT WEB UI                             │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
 │  │  Dashboard  │  │ Simulation  │  │  Training   │  │  Analytics  │ │
 │  │   Control   │  │    View     │  │   Monitor   │  │   Reports   │ │
@@ -74,23 +74,23 @@ Traditional parking systems assign bays on a first-come-first-served basis. Our 
 └───────────────────────────┬─────────────────────────────────────────┘
                             │
 ┌───────────────────────────┴─────────────────────────────────────────┐
-│                       APPLICATION LAYER                              │
+│                       APPLICATION LAYER                             │
 │  ┌─────────────────────────────────────────────────────────────────┐│
-│  │                    Simulation Engine                             ││
+│  │                    Simulation Engine                            ││
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ ││
 │  │  │  Event   │  │   Car    │  │  Traffic │  │   Time/Clock     │ ││
 │  │  │ Generator│  │ Spawner  │  │  Router  │  │   Controller     │ ││
 │  │  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘ ││
 │  └─────────────────────────────────────────────────────────────────┘│
 │  ┌─────────────────────────────────────────────────────────────────┐│
-│  │                 Neural Network Module                            ││
+│  │                 Neural Network Module                           ││
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ ││
 │  │  │ Feature  │  │   GNN    │  │  Output  │  │   Assignment     │ ││
 │  │  │ Encoder  │  │  Model   │  │ Decoder  │  │   Executor       │ ││
 │  │  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘ ││
 │  └─────────────────────────────────────────────────────────────────┘│
 │  ┌─────────────────────────────────────────────────────────────────┐│
-│  │                 Genetic Algorithm Trainer                        ││
+│  │                 Genetic Algorithm Trainer                       ││
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ ││
 │  │  │Population│  │ Fitness  │  │Selection │  │   Crossover/     │ ││
 │  │  │ Manager  │  │ Evaluator│  │ Strategy │  │   Mutation       │ ││
@@ -99,7 +99,7 @@ Traditional parking systems assign bays on a first-come-first-served basis. Our 
 └───────────────────────────┬─────────────────────────────────────────┘
                             │
 ┌───────────────────────────┴─────────────────────────────────────────┐
-│                         DATA LAYER                                   │
+│                         DATA LAYER                                  │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
 │  │  Car Park   │  │   Vehicle   │  │  Training   │  │   Model     │ │
 │  │   Config    │  │    Queue    │  │    Data     │  │  Checkpoints│ │
