@@ -1,0 +1,40 @@
+{
+    "car_park": {
+        "id": "wpark_main",
+        "name": "WPARK Simulation Car Park",
+        "levels": [
+            {
+                "level_number": -1,
+                "name": "Level -1 (Underground)",
+                "rows": 4,
+                "bays_per_row": 15,
+                "blue_badge_count": 4,
+                "parent_child_count": 3,
+                "ev_count": 2
+            },
+            {
+                "level_number": 0,
+                "name": "Level 0 (Ground)",
+                "rows": 4,
+                "bays_per_row": 18,
+                "blue_badge_count": 6,
+                "parent_child_count": 4,
+                "ev_count": 3
+            },
+            {
+                "level_number": 1,
+                "name": "Level 1 (First Floor)",
+                "rows": 4,
+                "bays_per_row": 20,
+                "blue_badge_count": 4,
+                "parent_child_count": 3,
+                "ev_count": 2
+            }
+        ]
+    },
+    "simulation": {
+        "default_arrival_rate": 2.0,
+        "default_strategy": "smart",
+        "shops_per_floor": 6
+    }
+}
