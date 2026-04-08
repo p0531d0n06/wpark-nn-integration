@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WPARK :: Car Park Simulation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="header">
+        <h1>⬡ WPARK SIMULATION</h1>
+        <div class="header-controls">
+            <span class="mode-indicator" id="mode-indicator">SIMULATION</span>
+            <div class="time-display">SIM TIME: <span id="sim-time">00:00</span></div>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Left Sidebar: Controls & Stats -->
+        <aside class="sidebar">
+            <h2>⚙ Controls</h2>
+            <div class="control-group">
+                <div class="btn-row">
+                    <button id="btn-step" class="btn">▶ STEP</button>
+                    <button id="btn-reset" class="btn">↺ RESET</button>
+                </div>
+                <button id="btn-auto" class="btn">▶ AUTO</button>
+            </div>
+            <div class="control-group">
+                <label>Time Step (min): <span id="time-step-value">1.0</span></label>
+                <input type="range" id="time-step" min="0.5" max="10" step="0.5" value="1">
+            </div>
+            <div class="control-group">
+                <label>Arrival Rate: <span id="arrival-rate-value">2.0</span>/min</label>
+                <input type="range" id="arrival-rate" min="0.5" max="10" step="0.5" value="2">
+            </div>
+            <div class="control-group">
+                <label>Assignment Strategy</label>
+                <select id="strategy-select"><option value="smart">SMART</option></select>
+            </div>
+
+            <h2>📊 Statistics</h2>
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="value" id="stat-occupancy">0%</div>
+                    <div class="label">Occupancy</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-arrivals">0</div>
+                    <div class="label">Arrivals</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-departures">0</div>
+                    <div class="label">Departures</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-queue">0</div>
+                    <div class="label">Queue</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-denied">0</div>
+                    <div class="label">Denied</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-avg-stay">0m</div>
+                    <div class="label">Avg Stay</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-entry-queue">0</div>
+                    <div class="label">Entry Queue</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-in-transit">0</div>
+                    <div class="label">In Transit</div>
+                </div>
+                <div class="stat-box">
+                    <div class="value" id="stat-congestion">0</div>
+                    <div class="label">Congestion</div>
+                </div>
+                <div class="stat-box" style="grid-column: 1 / -1;">
+                    <div class="value" id="stat-near-miss" style="font-size:14px">0</div>
+                    <div class="label">Near Misses</div>
+                </div>
+            </div>
+
+            <h2>⏳ Waiting Queue</h2>
+            <div id="queue-container" class="queue-panel"></div>
+
+            <h2>🧬 Training</h2>
+            <div class="training-controls">
+                <button id="btn-train-start" class="btn btn-accent">▶ START TRAINING</button>
+                <button id="btn-train-stop" class="btn btn-stop" style="display:none;">⏹ STOP TRAINING</button>
+                <div id="training-status" class="training-status">
+                    <div>Generation: <span id="train-gen">0</span></div>
+                    <div>Best Fitness: <span id="train-fitness">0.00</span></div>
+                    <div class="train-prog-wrap">
+                        <div id="train-progress" class="train-progress-bar"></div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content: Car Park Plan -->
+        <main class="main-content">
+            <!-- Training Panel — shown only during training, does NOT block map -->
+            <div id="training-overlay" class="training-overlay">
+                <div class="to-header">
+                    <span class="to-title">⬡ TRAINING</span>
+                    <span class="to-subtitle">Each generation = full 24 h day · <span id="to-workers">—</span> networks running in parallel</span>
+                </div>
+                <div class="to-metrics">
+                    <div class="to-metric">
+                        <div class="to-metric-val" id="to-gen">0</div>
+                        <div class="to-metric-lbl">Generation</div>
+                    </div>
+                    <div class="to-metric">
+                        <div class="to-metric-val" id="to-best">0.0</div>
+                        <div class="to-metric-lbl">Best Fitness</div>
+                    </div>
+                    <div class="to-metric">
+                        <div class="to-metric-val" id="to-avg">—</div>
+                        <div class="to-metric-lbl">Avg Fitness</div>
+                    </div>
+                    <div class="to-metric">
+                        <div class="to-metric-val" id="to-div">—</div>
+                        <div class="to-metric-lbl">Diversity</div>
+                    </div>
+                    <div class="to-metric">
+                        <div class="to-metric-val" id="to-eval">—</div>
+                        <div class="to-metric-lbl">Evaluated</div>
+                    </div>
+                </div>
+                <div class="to-prog-wrap">
+                    <div class="to-prog-label">Generation progress — <span id="to-prog-pct">0</span>% complete</div>
+                    <div class="to-prog-track">
+                        <div class="to-prog-fill" id="to-prog"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="carpark-container" class="carpark-container"></div>
+
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--bay-available);"></div>
+                    <span>Available</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--bay-occupied);"></div>
+                    <span>Occupied</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--bay-blue-badge); border-color: var(--info);"></div>
+                    <span>Blue Badge</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--bay-parent-child);"></div>
+                    <span>Parent &amp; Child</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--bay-ev); border-color: var(--success);"></div>
+                    <span>EV Charging</span>
+                </div>
+            </div>
+        </main>
+
+        <!-- Right Sidebar: Neural Network -->
+        <aside class="nn-sidebar" id="nn-sidebar">
+            <h2>🧠 Neural Network</h2>
+
+            <div class="nn-info-bar">
+                <div class="nn-info-item">
+                    <span class="nn-info-label">PARAMS</span>
+                    <span class="nn-info-val" id="nn-params">—</span>
+                </div>
+                <div class="nn-info-item">
+                    <span class="nn-info-label">CONFIDENCE</span>
+                    <span class="nn-info-val" id="nn-confidence">—</span>
+                </div>
+            </div>
+
+            <!-- SVG Network Diagram -->
+            <div class="nn-diagram-wrap">
+                <div class="nn-diagram-labels">
+                    <span>INPUT</span><span>H1</span><span>H2</span><span>OUT</span>
+                </div>
+                <svg id="nn-svg" class="nn-svg" xmlns="http://www.w3.org/2000/svg"
+                     viewBox="0 0 280 240" width="280" height="240"></svg>
+            </div>
+
+            <!-- Last Prediction -->
+            <div class="nn-pred-card">
+                <div class="nn-pred-title">LAST PREDICTION</div>
+                <div class="nn-pred-row">
+                    <span class="nn-pred-lbl">Vehicle</span>
+                    <span class="nn-pred-val" id="nn-pred-vehicle">—</span>
+                </div>
+                <div class="nn-pred-row">
+                    <span class="nn-pred-lbl">Available Bays</span>
+                    <span class="nn-pred-val" id="nn-pred-bays">—</span>
+                </div>
+                <div class="nn-pred-row">
+                    <span class="nn-pred-lbl">Selected Bay</span>
+                    <span class="nn-pred-val highlight" id="nn-pred-bay">—</span>
+                </div>
+                <div class="nn-pred-conf-wrap">
+                    <div class="nn-pred-row">
+                        <span class="nn-pred-lbl">Confidence</span>
+                        <span class="nn-pred-val" id="nn-pred-conf-val">—</span>
+                    </div>
+                    <div class="nn-conf-bar"><div class="nn-conf-fill" id="nn-conf-fill"></div></div>
+                </div>
+            </div>
+
+            <!-- Layer Activations -->
+            <div class="nn-section-title">LAYER ACTIVATIONS</div>
+            <div class="nn-activations" id="nn-activations"></div>
+
+            <!-- Fitness History -->
+            <div class="nn-section-title">FITNESS HISTORY</div>
+            <div class="nn-fitness-wrap">
+                <canvas id="fitness-canvas" width="260" height="80"></canvas>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Click Info Popup -->
+    <div id="info-popup" class="info-popup">
+        <div class="popup-header">
+            <span id="popup-title" class="popup-title-text"></span>
+            <button class="popup-close" id="popup-close">✕</button>
+        </div>
+        <div id="popup-body" class="popup-body"></div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/carParkRenderer.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
