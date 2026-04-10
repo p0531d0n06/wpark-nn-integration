@@ -24,10 +24,14 @@
             <h2>⚙ Controls</h2>
             <div class="control-group">
                 <div class="btn-row">
-                    <button id="btn-step" class="btn">▶ STEP</button>
+                    <button id="btn-step"  class="btn">▶ STEP</button>
                     <button id="btn-reset" class="btn">↺ RESET</button>
                 </div>
                 <button id="btn-auto" class="btn">▶ AUTO</button>
+                <div class="speed-row">
+                    <label>Speed: <span id="sim-speed-value">5</span>/s</label>
+                    <input type="range" id="sim-speed" min="1" max="20" step="1" value="5">
+                </div>
             </div>
             <div class="control-group">
                 <label>Time Step (min): <span id="time-step-value">1.0</span></label>
@@ -91,8 +95,11 @@
 
             <h2>🧬 Training</h2>
             <div class="training-controls">
-                <button id="btn-train-start" class="btn btn-accent">▶ START TRAINING</button>
-                <button id="btn-train-stop" class="btn btn-stop" style="display:none;">⏹ STOP TRAINING</button>
+                <div class="btn-row">
+                    <button id="btn-train-start" class="btn btn-accent">▶ TRAIN</button>
+                    <button id="btn-high-speed"  class="btn btn-speed">⚡ FAST</button>
+                </div>
+                <button id="btn-train-stop" class="btn btn-stop" style="display:none;">⏹ STOP</button>
                 <div id="training-status" class="training-status">
                     <div>Generation: <span id="train-gen">0</span></div>
                     <div>Best Fitness: <span id="train-fitness">0.00</span></div>
@@ -105,11 +112,12 @@
 
         <!-- Main Content: Car Park Plan -->
         <main class="main-content">
-            <!-- Training Panel — shown only during training, does NOT block map -->
+            <!-- Training Panel — compact, above the map -->
             <div id="training-overlay" class="training-overlay">
                 <div class="to-header">
                     <span class="to-title">⬡ TRAINING</span>
-                    <span class="to-subtitle">Each generation = full 24 h day · <span id="to-workers">—</span> networks running in parallel</span>
+                    <span class="to-subtitle">Each generation = full 24 h day · <span id="to-workers">—</span> networks in parallel</span>
+                    <span id="to-speed-badge" class="to-speed-badge" style="display:none;">⚡ HIGH SPEED</span>
                 </div>
                 <div class="to-metrics">
                     <div class="to-metric">
@@ -145,84 +153,101 @@
 
             <div class="legend">
                 <div class="legend-item">
-                    <div class="legend-color" style="background: var(--bay-available);"></div>
+                    <div class="legend-dot" style="background:#4CAF50;"></div>
                     <span>Available</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-color" style="background: var(--bay-occupied);"></div>
-                    <span>Occupied</span>
+                    <div class="legend-dot" style="background:#ff8800;"></div>
+                    <span>Occupied (dot)</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-color" style="background: var(--bay-blue-badge); border-color: var(--info);"></div>
+                    <div class="legend-dot" style="background:#4488ff;"></div>
                     <span>Blue Badge</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-color" style="background: var(--bay-parent-child);"></div>
+                    <div class="legend-dot" style="background:#aa66cc;"></div>
                     <span>Parent &amp; Child</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-color" style="background: var(--bay-ev); border-color: var(--success);"></div>
+                    <div class="legend-dot" style="background:#44ff66;"></div>
                     <span>EV Charging</span>
                 </div>
             </div>
         </main>
 
-        <!-- Right Sidebar: Neural Network -->
+        <!-- Right Sidebar: Neural Network + Networks + Report tabs -->
         <aside class="nn-sidebar" id="nn-sidebar">
-            <h2>🧠 Neural Network</h2>
-
-            <div class="nn-info-bar">
-                <div class="nn-info-item">
-                    <span class="nn-info-label">PARAMS</span>
-                    <span class="nn-info-val" id="nn-params">—</span>
-                </div>
-                <div class="nn-info-item">
-                    <span class="nn-info-label">CONFIDENCE</span>
-                    <span class="nn-info-val" id="nn-confidence">—</span>
-                </div>
+            <div class="tab-bar">
+                <button class="tab-btn active" data-tab="nn">🧠 NET</button>
+                <button class="tab-btn" data-tab="networks">🏆 NNs</button>
+                <button class="tab-btn" data-tab="report">📋 REPORT</button>
             </div>
 
-            <!-- SVG Network Diagram -->
-            <div class="nn-diagram-wrap">
-                <div class="nn-diagram-labels">
-                    <span>INPUT</span><span>H1</span><span>H2</span><span>OUT</span>
-                </div>
-                <svg id="nn-svg" class="nn-svg" xmlns="http://www.w3.org/2000/svg"
-                     viewBox="0 0 280 240" width="280" height="240"></svg>
-            </div>
-
-            <!-- Last Prediction -->
-            <div class="nn-pred-card">
-                <div class="nn-pred-title">LAST PREDICTION</div>
-                <div class="nn-pred-row">
-                    <span class="nn-pred-lbl">Vehicle</span>
-                    <span class="nn-pred-val" id="nn-pred-vehicle">—</span>
-                </div>
-                <div class="nn-pred-row">
-                    <span class="nn-pred-lbl">Available Bays</span>
-                    <span class="nn-pred-val" id="nn-pred-bays">—</span>
-                </div>
-                <div class="nn-pred-row">
-                    <span class="nn-pred-lbl">Selected Bay</span>
-                    <span class="nn-pred-val highlight" id="nn-pred-bay">—</span>
-                </div>
-                <div class="nn-pred-conf-wrap">
-                    <div class="nn-pred-row">
-                        <span class="nn-pred-lbl">Confidence</span>
-                        <span class="nn-pred-val" id="nn-pred-conf-val">—</span>
+            <!-- TAB: Neural Net (existing) -->
+            <div class="tab-pane active" id="tab-nn">
+                <div class="nn-info-bar">
+                    <div class="nn-info-item">
+                        <span class="nn-info-label">PARAMS</span>
+                        <span class="nn-info-val" id="nn-params">—</span>
                     </div>
-                    <div class="nn-conf-bar"><div class="nn-conf-fill" id="nn-conf-fill"></div></div>
+                    <div class="nn-info-item">
+                        <span class="nn-info-label">CONFIDENCE</span>
+                        <span class="nn-info-val" id="nn-confidence">—</span>
+                    </div>
+                </div>
+
+                <div class="nn-diagram-wrap">
+                    <div class="nn-diagram-labels">
+                        <span>INPUT</span><span>H1</span><span>H2</span><span>OUT</span>
+                    </div>
+                    <svg id="nn-svg" class="nn-svg" xmlns="http://www.w3.org/2000/svg"
+                         viewBox="0 0 280 240" width="280" height="240"></svg>
+                </div>
+
+                <div class="nn-pred-card">
+                    <div class="nn-pred-title">LAST PREDICTION</div>
+                    <div class="nn-pred-row">
+                        <span class="nn-pred-lbl">Vehicle</span>
+                        <span class="nn-pred-val" id="nn-pred-vehicle">—</span>
+                    </div>
+                    <div class="nn-pred-row">
+                        <span class="nn-pred-lbl">Available Bays</span>
+                        <span class="nn-pred-val" id="nn-pred-bays">—</span>
+                    </div>
+                    <div class="nn-pred-row">
+                        <span class="nn-pred-lbl">Selected Bay</span>
+                        <span class="nn-pred-val highlight" id="nn-pred-bay">—</span>
+                    </div>
+                    <div class="nn-pred-conf-wrap">
+                        <div class="nn-pred-row">
+                            <span class="nn-pred-lbl">Confidence</span>
+                            <span class="nn-pred-val" id="nn-pred-conf-val">—</span>
+                        </div>
+                        <div class="nn-conf-bar"><div class="nn-conf-fill" id="nn-conf-fill"></div></div>
+                    </div>
+                </div>
+
+                <div class="nn-section-title">LAYER ACTIVATIONS</div>
+                <div class="nn-activations" id="nn-activations"></div>
+
+                <div class="nn-section-title">FITNESS HISTORY</div>
+                <div class="nn-fitness-wrap">
+                    <canvas id="fitness-canvas" width="260" height="80"></canvas>
                 </div>
             </div>
 
-            <!-- Layer Activations -->
-            <div class="nn-section-title">LAYER ACTIVATIONS</div>
-            <div class="nn-activations" id="nn-activations"></div>
+            <!-- TAB: Networks leaderboard -->
+            <div class="tab-pane" id="tab-networks">
+                <div id="networks-content" class="networks-content">
+                    <div class="tab-empty">Start training to see network scores.</div>
+                </div>
+            </div>
 
-            <!-- Fitness History -->
-            <div class="nn-section-title">FITNESS HISTORY</div>
-            <div class="nn-fitness-wrap">
-                <canvas id="fitness-canvas" width="260" height="80"></canvas>
+            <!-- TAB: Generation report history -->
+            <div class="tab-pane" id="tab-report">
+                <div id="report-content" class="report-content">
+                    <div class="tab-empty">No generations completed yet.</div>
+                </div>
             </div>
         </aside>
     </div>

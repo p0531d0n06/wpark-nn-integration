@@ -180,68 +180,73 @@ class NeuralNetwork:
         
         return np.array(features, dtype=np.float32)
     
-    def forward(self, vehicle_features: np.ndarray, context_features: np.ndarray, 
-                bay_features: np.ndarray) -> np.ndarray:
+    def forward(self, vehicle_features: np.ndarray, context_features: np.ndarray,
+                bay_features: np.ndarray, store_activations: bool = True) -> np.ndarray:
         """
         Forward pass through the network.
-        
+
         Args:
             vehicle_features: (VEHICLE_FEATURES,) vehicle encoding
             context_features: (CONTEXT_FEATURES,) context encoding
             bay_features: (num_bays, BAY_FEATURES) bay encodings
-            
+            store_activations: whether to save activations for UI visualisation
+
         Returns:
             Bay selection probabilities (num_bays,)
         """
         # Combine vehicle and context
         x = np.concatenate([vehicle_features, context_features])
-        self.last_input = x.copy()
-        self.last_activations = [x.copy()]
-        
+        if store_activations:
+            self.last_input = x.copy()
+            self.last_activations = [x.copy()]
+
         # Pass through hidden layers
         for i, (w, b) in enumerate(zip(self.weights, self.biases)):
             x = self.relu(x @ w + b)
-            self.last_activations.append(x.copy())
-        
-        # Score each bay
+            if store_activations:
+                self.last_activations.append(x.copy())
+
+        # Score all bays in one batched matrix multiply instead of a Python loop.
+        # Tile the hidden vector to (num_bays, hidden_size) then concat bay features.
         num_bays = bay_features.shape[0]
-        scores = np.zeros(num_bays)
-        
-        for i in range(num_bays):
-            # Combine context encoding with bay features
-            combined = np.concatenate([x, bay_features[i]])
-            scores[i] = (combined @ self.bay_scorer_weights + self.bay_scorer_bias)[0]
-        
-        self.last_bay_scores = scores.copy()
-        
+        x_tiled = np.broadcast_to(x, (num_bays, x.shape[0]))          # (N, hidden)
+        combined = np.concatenate([x_tiled, bay_features], axis=1)     # (N, hidden+bay)
+        scores = combined @ self.bay_scorer_weights + self.bay_scorer_bias  # (N, 1)
+        scores = scores.squeeze(-1)                                      # (N,)
+
+        if store_activations:
+            self.last_bay_scores = scores.copy()
+
         # Softmax for probabilities
         probs = self.softmax(scores)
-        self.last_output = probs.copy()
-        
+        if store_activations:
+            self.last_output = probs.copy()
+
         return probs
     
-    def predict(self, vehicle: Vehicle, car_park: CarPark, 
+    def predict(self, vehicle: Vehicle, car_park: CarPark,
                 available_bays: List[ParkingBay], current_time: float,
-                queue_length: int = 0) -> Tuple[Optional[str], np.ndarray]:
+                queue_length: int = 0, store_activations: bool = True) -> Tuple[Optional[str], np.ndarray]:
         """
         Predict best bay for a vehicle.
-        
+
         Returns:
             Tuple of (best_bay_id or None, probabilities array)
         """
         if not available_bays:
             return None, np.array([])
-        
+
         # Encode inputs
         vehicle_features = self.encode_vehicle(vehicle)
         context_features = self.encode_context(car_park, current_time, queue_length)
-        
+
         target_floor = vehicle.target_floor if vehicle.target_floor is not None else 0
         bay_features = np.array([self.encode_bay(bay, target_floor) for bay in available_bays])
-        
-        # Forward pass
-        probs = self.forward(vehicle_features, context_features, bay_features)
-        
+
+        # Forward pass — skip storing activations in training/headless mode
+        probs = self.forward(vehicle_features, context_features, bay_features,
+                             store_activations=store_activations)
+
         # Select highest probability bay
         best_idx = np.argmax(probs)
         return available_bays[best_idx].id, probs
@@ -340,22 +345,25 @@ class NeuralNetwork:
 
 class NeuralNetworkAssignment:
     """Assignment strategy using neural network."""
-    
-    def __init__(self, network: NeuralNetwork = None):
+
+    def __init__(self, network: NeuralNetwork = None, training_mode: bool = False):
         self.network = network or NeuralNetwork()
         self.last_prediction_info: Dict = {}
-    
+        # When True, skips storing activations and prediction info (faster for training)
+        self.training_mode = training_mode
+
     def assign(self, vehicle: Vehicle, car_park: CarPark, shops: List,
                shop_floor_map: Dict[str, int], current_time: float = 0.0,
                queue_length: int = 0) -> Optional[str]:
         """Assign a bay using neural network prediction."""
         # Get available bays
         available_bays = car_park.get_all_available_bays()
-        
+
         if not available_bays:
-            self.last_prediction_info = {'error': 'No available bays'}
+            if not self.training_mode:
+                self.last_prediction_info = {'error': 'No available bays'}
             return None
-        
+
         # Handle special requirements first
         required_type = None
         if vehicle.requires_blue_badge:
@@ -364,30 +372,32 @@ class NeuralNetworkAssignment:
             required_type = BayType.PARENT_CHILD
         elif vehicle.requires_ev_charging:
             required_type = BayType.EV
-        
+
         # Filter by required type if needed
         if required_type:
             type_bays = [b for b in available_bays if b.bay_type == required_type]
             if type_bays:
                 available_bays = type_bays
-        
-        # Get prediction from network
+
+        # Get prediction from network — skip activation storage in training mode
         best_bay_id, probs = self.network.predict(
-            vehicle, car_park, available_bays, current_time, queue_length
+            vehicle, car_park, available_bays, current_time, queue_length,
+            store_activations=not self.training_mode
         )
-        
-        # Store prediction info for visualization
-        if len(probs) > 0:
-            sorted_probs = sorted(probs.tolist(), reverse=True)[:3]
+
+        # Store prediction info — full detail for UI, minimal in training mode
+        conf = float(np.max(probs)) if len(probs) > 0 else 0.0
+        if not self.training_mode:
+            sorted_probs = sorted(probs.tolist(), reverse=True)[:3] if len(probs) > 0 else []
+            self.last_prediction_info = {
+                'vehicle_id': vehicle.id,
+                'available_count': len(available_bays),
+                'selected_bay': best_bay_id,
+                'confidence': conf,
+                'top_3_probs': sorted_probs
+            }
         else:
-            sorted_probs = []
-            
-        self.last_prediction_info = {
-            'vehicle_id': vehicle.id,
-            'available_count': len(available_bays),
-            'selected_bay': best_bay_id,
-            'confidence': float(np.max(probs)) if len(probs) > 0 else 0.0,
-            'top_3_probs': sorted_probs
-        }
+            # Only track confidence — needed for nn_avg_confidence fitness term
+            self.last_prediction_info = {'confidence': conf}
         
         return best_bay_id

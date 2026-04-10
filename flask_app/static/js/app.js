@@ -1,6 +1,7 @@
 /**
  * WPARK Simulation — Main Application
- * Uses ParkingPlanRenderer + VehicleAnimator from carParkRenderer.js
+ * Tabs: Neural Net | Networks leaderboard | Generation Report
+ * High Speed mode skips simulation rendering during training.
  */
 
 const PURPOSE_COLORS = {
@@ -25,16 +26,18 @@ const NN_INPUT_LABELS = [
 
 class WPARKSimulation {
     constructor() {
-        this.state         = null;
-        this.autoRun       = false;
+        this.state           = null;
+        this.autoRun         = false;
         this.autoRunInterval = null;
-        this.animQueue     = [];        // pending animation events
+        this.animQueue       = [];
         this.drivingVehicles = new Set();
-        this.fitnessHistory = [];
-        this.trainingActive = false;
-        this.trainingInterval = null;
-        this._trainingTick  = 0;
-        this.popup = null;
+        this.fitnessHistory  = [];
+        this.trainingActive  = false;
+        this.trainingInterval= null;
+        this._trainingTick   = 0;
+        this.highSpeed       = false;   // skip sim steps during training
+        this.popup           = null;
+        this.activeTab       = 'nn';
 
         this.renderer = new ParkingPlanRenderer();
         this.animator = new VehicleAnimator(() =>
@@ -46,10 +49,10 @@ class WPARKSimulation {
             if (el) el.textContent = (parseInt(el.textContent || '0') + 1).toString();
         });
 
-        this.renderer.onBayClick((e, bayId, lvl)  => this.showBayPopup(e, bayId, lvl));
-        this.renderer.onVehicleClick((e, vid)      => this.showVehiclePopup(e, vid));
+        this.renderer.onBayClick((e, bayId, lvl) => this.showBayPopup(e, bayId, lvl));
+        this.renderer.onVehicleClick((e, vid)    => this.showVehiclePopup(e, vid));
 
-        this.config = { timeStep: 1.0, arrivalRate: 2.0, strategy: 'smart' };
+        this.config = { timeStep: 1.0, arrivalRate: 2.0, strategy: 'smart', simSpeed: 5 };
         this.init();
     }
 
@@ -69,6 +72,7 @@ class WPARKSimulation {
         document.getElementById('btn-auto').addEventListener('click',  () => this.toggleAutoRun());
         document.getElementById('btn-train-start').addEventListener('click', () => this.startTraining());
         document.getElementById('btn-train-stop').addEventListener('click',  () => this.stopTraining());
+        document.getElementById('btn-high-speed').addEventListener('click',  () => this.toggleHighSpeed());
         document.getElementById('popup-close').addEventListener('click', () => this.closePopup());
 
         document.getElementById('time-step').addEventListener('input', e => {
@@ -84,6 +88,15 @@ class WPARKSimulation {
             this.config.strategy = e.target.value;
             this.updateConfig();
         });
+        document.getElementById('sim-speed').addEventListener('input', e => {
+            this.config.simSpeed = parseInt(e.target.value);
+            document.getElementById('sim-speed-value').textContent = this.config.simSpeed;
+            // Restart auto-run interval at new rate if currently running
+            if (this.autoRun) {
+                clearInterval(this.autoRunInterval);
+                this.autoRunInterval = setInterval(() => this.step(), this._stepIntervalMs());
+            }
+        });
         document.addEventListener('click', e => {
             if (this.popup.classList.contains('visible') &&
                 !this.popup.contains(e.target) &&
@@ -91,6 +104,22 @@ class WPARKSimulation {
                 !e.target.closest('.sv-vehicle')) {
                 this.closePopup();
             }
+        });
+
+        // Tab switching
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const tab = btn.dataset.tab;
+                this.activeTab = tab;
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById(`tab-${tab}`).classList.add('active');
+                // Refresh content immediately
+                if (tab === 'networks' || tab === 'report') {
+                    this.fetchGenerationReport();
+                }
+            });
         });
     }
 
@@ -115,13 +144,25 @@ class WPARKSimulation {
     // ── Simulation step ──────────────────────────────────────────
     async step() {
         try {
+            // During training use 5-min steps to match the evaluation granularity.
+            const timeDelta = this.trainingActive ? 5.0 : this.config.timeStep;
             const res = await fetch('/api/step', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ time_delta: this.config.timeStep })
+                body: JSON.stringify({ time_delta: timeDelta })
             });
             const data = await res.json();
-            if (data.animations?.length) this.animQueue.push(...data.animations);
+            // Backend reset the simulation for the new generation — clear all
+            // client-side animation state so nothing stale plays.
+            if (data.reset) {
+                this.animQueue = [];
+                this.drivingVehicles.clear();
+                this.animator.clear();
+            }
+            // In high-speed training mode, skip animations but still update the map
+            if (!(this.highSpeed && this.trainingActive) && data.animations?.length) {
+                this.animQueue.push(...data.animations);
+            }
             await this.fetchState();
             this.render();
             this.updateNN();
@@ -152,15 +193,42 @@ class WPARKSimulation {
         } catch(e) {}
     }
 
+    _stepIntervalMs() {
+        return Math.round(1000 / this.config.simSpeed);
+    }
+
     toggleAutoRun() {
         this.autoRun = !this.autoRun;
         const btn = document.getElementById('btn-auto');
         if (this.autoRun) {
             btn.textContent = '⏸ PAUSE'; btn.classList.add('active');
-            this.autoRunInterval = setInterval(() => this.step(), 350);
+            this.autoRunInterval = setInterval(() => this.step(), this._stepIntervalMs());
         } else {
             btn.textContent = '▶ AUTO'; btn.classList.remove('active');
             clearInterval(this.autoRunInterval);
+        }
+    }
+
+    // ── High speed mode ──────────────────────────────────────────
+    toggleHighSpeed() {
+        this.highSpeed = !this.highSpeed;
+        const btn   = document.getElementById('btn-high-speed');
+        const badge = document.getElementById('to-speed-badge');
+        btn.classList.toggle('active', this.highSpeed);
+        btn.textContent = this.highSpeed ? '⚡ FAST ON' : '⚡ FAST';
+        if (badge) badge.style.display = this.highSpeed && this.trainingActive ? 'inline' : 'none';
+
+        // Flush stale animations so vehicles that entered/exited during the
+        // previous mode don't replay incorrectly in the new mode.
+        this.animQueue = [];
+        this.drivingVehicles.clear();
+        this.animator.clear();
+
+        // Sync the polling interval with the new speed setting.
+        if (this.trainingActive) {
+            clearInterval(this.trainingInterval);
+            const pollMs = this.highSpeed ? 200 : 400;
+            this.trainingInterval = setInterval(() => this.pollTraining(), pollMs);
         }
     }
 
@@ -170,7 +238,6 @@ class WPARKSimulation {
         this.renderHeader();
         this.renderStats();
         this.renderQueue();
-
         const container = document.getElementById('carpark-container');
         this.renderer.render(container, this.state.levels, this.state, this.drivingVehicles);
     }
@@ -191,7 +258,6 @@ class WPARKSimulation {
         document.getElementById('stat-queue').textContent      = this.state.waiting_queue.length;
         document.getElementById('stat-denied').textContent     = s.total_denied;
         document.getElementById('stat-avg-stay').textContent   = `${s.avg_stay_duration.toFixed(0)}m`;
-        // Traffic
         const entryQEl = document.getElementById('stat-entry-queue');
         if (entryQEl) entryQEl.textContent = t.entry_queue_length ?? 0;
         const transitEl = document.getElementById('stat-in-transit');
@@ -206,7 +272,10 @@ class WPARKSimulation {
         if (!q.length) { el.innerHTML = '<div class="queue-empty">No vehicles waiting</div>'; return; }
         el.innerHTML = q.slice(0, 5).map(v => `
             <div class="queue-item">
-                <div class="queue-car" style="background:${v.color}"></div>
+                <svg width="16" height="16" style="flex-shrink:0">
+                    <circle cx="8" cy="8" r="6" fill="${v.color}" opacity="0.9"/>
+                    <circle cx="7" cy="7" r="2" fill="rgba(255,255,255,0.4)"/>
+                </svg>
                 <div class="queue-info">
                     <div class="queue-id">${v.id}</div>
                     <div class="queue-detail">${v.purpose.replace(/_/g,' ')} → ${v.target_shop || 'any'}</div>
@@ -222,58 +291,53 @@ class WPARKSimulation {
             if (!this.animQueue.length) return;
             const batch = this.animQueue.splice(0, this.animQueue.length);
             batch.forEach(a => this.playAnim(a));
-        }, 120);
+        }, 100);
     }
 
     playAnim(anim) {
         if (!this.state) return;
+        if (this.highSpeed && this.trainingActive) return; // skip in high speed
 
-        if (anim.type === 'enter') {
-            const vehicle = anim.vehicle;
-            const path = this.renderer.computeEntryPath(
-                vehicle, anim.level, anim.bay_id, this.state.levels
-            );
-            if (!path) return;
-
-            this.drivingVehicles.add(vehicle.id);
-            this.animator.start(vehicle, path, () => {
-                this.drivingVehicles.delete(vehicle.id);
-            });
-        }
-
-        if (anim.type === 'exit') {
-            const vehicle = anim.vehicle;
-            const path = this.renderer.computeExitPath(
-                vehicle, anim.level, anim.bay_id, this.state.levels
-            );
-            if (!path) return;
-            this.animator.start(vehicle, path, () => {});
+        try {
+            if (anim.type === 'enter') {
+                const vehicle = anim.vehicle;
+                const path = this.renderer.computeEntryPath(vehicle, anim.level, anim.bay_id, this.state.levels);
+                if (!path) { console.warn('No entry path for', anim); return; }
+                this.drivingVehicles.add(vehicle.id);
+                this.animator.start(vehicle, path, () => { this.drivingVehicles.delete(vehicle.id); });
+            }
+            if (anim.type === 'exit') {
+                const vehicle = anim.vehicle;
+                const path = this.renderer.computeExitPath(vehicle, anim.level, anim.bay_id, this.state.levels);
+                if (!path) { console.warn('No exit path for', anim); return; }
+                this.drivingVehicles.delete(vehicle.id); // remove from driving set on exit
+                this.animator.start(vehicle, path, () => {});
+            }
+        } catch(e) {
+            console.error('playAnim error:', e, anim);
         }
     }
 
-    // ── Popup system ────────────────────────────────────────────
+    // ── Popup system ─────────────────────────────────────────────
     showBayPopup(event, bayId, levelNum) {
         if (!this.state) return;
         const level = this.state.levels.find(l => l.level_number === levelNum);
         if (!level) return;
         const bay = level.bays.find(b => b.id === bayId);
         if (!bay) return;
-
         const vehicle = bay.occupied_by ? this.state.active_vehicles[bay.occupied_by] : null;
-
         const typeIcon  = { standard:'🅿', blue_badge:'♿', parent_child:'👶', ev:'⚡' };
         const typeColor = { standard:'var(--text-muted)', blue_badge:'var(--info)',
                             parent_child:'#aa66cc', ev:'var(--success)' };
-
         let vBlock = '';
         if (vehicle) {
-            const st = this.state.current_time - vehicle.arrival_time;
+            const st  = this.state.current_time - vehicle.arrival_time;
             const pct = Math.min(100, (st / vehicle.estimated_stay_minutes) * 100);
             vBlock = `
                 <div class="popup-divider"></div>
                 <div class="popup-sub">PARKED VEHICLE</div>
                 <div class="popup-row-c">
-                    <span class="popup-swatch" style="background:${vehicle.color}"></span>
+                    <svg width="16" height="16"><circle cx="8" cy="8" r="6" fill="${vehicle.color}"/><circle cx="7" cy="7" r="2" fill="rgba(255,255,255,0.4)"/></svg>
                     <span class="popup-hl">${vehicle.id}</span>
                 </div>
                 <div class="popup-kv"><span class="pk">Purpose</span>
@@ -282,7 +346,6 @@ class WPARKSimulation {
                 <div class="popup-kv"><span class="pk">Stay</span><span class="pv">${st.toFixed(0)}/${vehicle.estimated_stay_minutes.toFixed(0)} min</span></div>
                 <div class="popup-prog"><div class="popup-prog-fill" style="width:${pct}%;background:${vehicle.color}"></div></div>`;
         }
-
         document.getElementById('popup-title').textContent = `${typeIcon[bay.bay_type]||'🅿'} Bay ${bay.row}${bay.position}`;
         document.getElementById('popup-body').innerHTML = `
             <div class="popup-type-lbl" style="color:${typeColor[bay.bay_type]}">${typeIcon[bay.bay_type]} ${bay.bay_type.replace(/_/g,' ').toUpperCase()}</div>
@@ -291,7 +354,6 @@ class WPARKSimulation {
             <div class="popup-kv"><span class="pk">Shop Gate</span><span class="pv">${bay.distance_to_lift.toFixed(0)}u</span></div>
             <div class="popup-kv"><span class="pk">Exit Dist</span><span class="pv">${bay.distance_to_exit.toFixed(0)}u</span></div>
             ${vBlock}`;
-
         this._posPopup(event);
         this.popup.classList.add('visible');
     }
@@ -300,21 +362,18 @@ class WPARKSimulation {
         if (!this.state) return;
         const v = this.state.active_vehicles[vehicleId];
         if (!v) return;
-
         const stayTime = this.state.current_time - v.arrival_time;
         const pct      = Math.min(100, (stayTime / v.estimated_stay_minutes) * 100);
         const leftMins = Math.max(0, v.estimated_stay_minutes - stayTime);
         const sizeI    = { compact:'🚗', standard:'🚙', large:'🚐', oversized:'🚛' };
-
-        const badges = [
-            v.requires_blue_badge    ? `<span class="acc-badge" style="background:var(--info)">♿ Blue Badge</span>` : '',
-            v.requires_parent_child  ? `<span class="acc-badge" style="background:#aa66cc">👶 P&amp;C</span>` : '',
-            v.requires_ev_charging   ? `<span class="acc-badge" style="background:var(--success);color:#000">⚡ EV</span>` : ''
+        const badges   = [
+            v.requires_blue_badge   ? `<span class="acc-badge" style="background:var(--info)">♿ Blue Badge</span>` : '',
+            v.requires_parent_child ? `<span class="acc-badge" style="background:#aa66cc">👶 P&amp;C</span>` : '',
+            v.requires_ev_charging  ? `<span class="acc-badge" style="background:var(--success);color:#000">⚡ EV</span>` : ''
         ].filter(Boolean).join('');
 
         document.getElementById('popup-title').innerHTML =
-            `<span style="display:inline-block;width:10px;height:10px;background:${v.color};border-radius:2px;margin-right:5px"></span>${v.id}`;
-
+            `<svg width="12" height="12" style="vertical-align:middle;margin-right:5px"><circle cx="6" cy="6" r="5" fill="${v.color}"/></svg>${v.id}`;
         document.getElementById('popup-body').innerHTML = `
             <div class="popup-header-row">
                 <span class="popup-badge pb-purpose" style="background:${PURPOSE_COLORS[v.purpose]||'#888'}">${v.purpose.replace(/_/g,' ')}</span>
@@ -336,7 +395,6 @@ class WPARKSimulation {
                 <span class="pv">${(v.priority * 10).toFixed(1)} / 10</span>
             </div>
             ${badges ? `<div class="popup-divider"></div><div class="popup-badges-row">${badges}</div>` : ''}`;
-
         this._posPopup(event);
         this.popup.classList.add('visible');
     }
@@ -356,11 +414,9 @@ class WPARKSimulation {
     async updateNN() {
         try {
             const data = await (await fetch('/api/neural_network')).json();
-
             document.getElementById('nn-params').textContent     = data.total_params.toLocaleString();
             const conf = data.prediction_info?.confidence;
             document.getElementById('nn-confidence').textContent = conf != null ? `${(conf * 100).toFixed(1)}%` : '—';
-
             this.renderNNDiagram(data);
             this.renderNNPrediction(data.prediction_info);
             this.renderNNActivations(data.layers);
@@ -377,42 +433,38 @@ class WPARKSimulation {
         const colX    = [66, 134, 202, 262];
         const maxShow = [14,  12,  10,   8];
 
-        // Connections first (behind nodes)
         layers.forEach((layer, li) => {
             if (li >= layers.length - 1) return;
             const nx = colX[li], nx2 = colX[li + 1];
-            const show  = Math.min(layer.output_size,            maxShow[li]);
-            const show2 = Math.min(layers[li + 1].output_size,   maxShow[li + 1]);
+            const show  = Math.min(layer.output_size,          maxShow[li]);
+            const show2 = Math.min(layers[li+1].output_size,   maxShow[li+1]);
             const sp    = (H - 36) / (show  + 1);
             const sp2   = (H - 36) / (show2 + 1);
             const acts  = layer.activations || [];
-
             for (let n = 0; n < show; n++) {
                 const y1  = 18 + sp * (n + 1);
                 const act = Math.abs(acts[n] || 0);
-                const op  = Math.max(0.025, Math.min(act * 0.22, 0.22));
+                const op  = Math.max(0.02, Math.min(act * 0.20, 0.20));
                 const stride = Math.max(1, Math.ceil(show2 / 4));
                 for (let t = 0; t < show2; t += stride) {
                     const y2 = 18 + sp2 * (t + 1);
                     const cx = (nx + nx2) / 2;
                     const p  = this._svgEl('path');
                     p.setAttribute('d', `M${nx},${y1} C${cx},${y1} ${cx},${y2} ${nx2},${y2}`);
-                    p.setAttribute('stroke',       `rgba(255,136,0,${op})`);
+                    p.setAttribute('stroke', `rgba(255,136,0,${op})`);
                     p.setAttribute('stroke-width', '0.7');
-                    p.setAttribute('fill',         'none');
+                    p.setAttribute('fill', 'none');
                     svg.appendChild(p);
                 }
             }
         });
 
-        // Neurons
         layers.forEach((layer, li) => {
             const x    = colX[li];
             const tot  = layer.output_size;
             const show = Math.min(tot, maxShow[li]);
             const sp   = (H - 36) / (show + 1);
             const acts = layer.activations || [];
-
             for (let n = 0; n < show; n++) {
                 const y   = 18 + sp * (n + 1);
                 const act = acts[n] || 0;
@@ -420,8 +472,7 @@ class WPARKSimulation {
                 const int = 0.25 + Math.min(abs, 1) * 0.75;
                 const r   = act >= 0 ? 255 : Math.floor(80 * (1 - abs));
                 const gb  = Math.floor(80 + abs * 56);
-                const bl  = act <  0 ? 255 : 0;
-
+                const bl  = act < 0 ? 255 : 0;
                 if (abs > 0.45) {
                     const glow = this._svgEl('circle');
                     glow.setAttribute('cx', x); glow.setAttribute('cy', y); glow.setAttribute('r', 8);
@@ -430,13 +481,11 @@ class WPARKSimulation {
                 }
                 const c = this._svgEl('circle');
                 c.setAttribute('cx', x); c.setAttribute('cy', y);
-                c.setAttribute('r',  li === 0 ? 5 : 4.5);
+                c.setAttribute('r', li === 0 ? 5 : 4.5);
                 c.setAttribute('fill',   `rgba(${r},${gb},${bl},${int})`);
                 c.setAttribute('stroke', `rgba(255,136,0,0.35)`);
                 c.setAttribute('stroke-width', '0.5');
                 svg.appendChild(c);
-
-                // Input labels
                 if (li === 0 && n < NN_INPUT_LABELS.length) {
                     const lbl = this._svgEl('text');
                     lbl.setAttribute('x', x - 8); lbl.setAttribute('y', y + 3);
@@ -448,7 +497,6 @@ class WPARKSimulation {
                     svg.appendChild(lbl);
                 }
             }
-
             if (tot > show) {
                 const d = this._svgEl('text');
                 d.setAttribute('x', x); d.setAttribute('y', 18 + sp * (show + 0.7));
@@ -458,7 +506,6 @@ class WPARKSimulation {
                 d.textContent = '···';
                 svg.appendChild(d);
             }
-
             const lbl = this._svgEl('text');
             lbl.setAttribute('x', x); lbl.setAttribute('y', H - 4);
             lbl.setAttribute('text-anchor', 'middle');
@@ -475,7 +522,6 @@ class WPARKSimulation {
         document.getElementById('nn-pred-vehicle').textContent = info.vehicle_id || '—';
         document.getElementById('nn-pred-bays').textContent    = info.available_count ?? '—';
         document.getElementById('nn-pred-bay').textContent     = info.selected_bay || '—';
-
         const conf = info.confidence || 0;
         document.getElementById('nn-pred-conf-val').textContent = `${(conf * 100).toFixed(1)}%`;
         const fill = document.getElementById('nn-conf-fill');
@@ -493,14 +539,12 @@ class WPARKSimulation {
                 const maxAbs = Math.max(...acts.map(Math.abs), 0.001);
                 const avgAbs = acts.reduce((a, b) => a + Math.abs(b), 0) / acts.length;
                 const pct    = Math.min(100, (avgAbs / maxAbs) * 100);
-
                 const sparks = acts.slice(0, 26).map(a => {
                     const n = Math.abs(a) / maxAbs;
                     const h = Math.max(2, n * 16);
                     const col = a >= 0 ? `rgba(255,136,0,${0.3 + n * 0.7})` : `rgba(68,136,255,${0.3 + n * 0.7})`;
                     return `<div class="act-spark" style="height:${h}px;background:${col}"></div>`;
                 }).join('');
-
                 return `
                 <div class="act-row">
                     <div class="act-header">
@@ -515,7 +559,7 @@ class WPARKSimulation {
 
     _svgEl(tag) { return document.createElementNS('http://www.w3.org/2000/svg', tag); }
 
-    // ── Training ─────────────────────────────────────────────────
+    // ── Training ──────────────────────────────────────────────────
     async startTraining() {
         try {
             this.config.strategy = 'neural_network';
@@ -525,18 +569,30 @@ class WPARKSimulation {
             await fetch('/api/training/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ population_size: 20 })
+                body: JSON.stringify({
+                    population_size: 30,
+                    elite_count: 4,
+                    fast_mode: this.highSpeed
+                })
             });
 
             this.trainingActive  = true;
             this._trainingTick   = 0;
+            this._lastEvalCount  = 0;
+            // Speed up animations to match the faster sim cadence during training.
+            this.animator.setSpeedScale(3.0);
             document.getElementById('btn-train-start').style.display = 'none';
             document.getElementById('btn-train-stop').style.display  = 'block';
-            document.getElementById('mode-indicator').textContent = 'TRAINING';
+            document.getElementById('mode-indicator').textContent    = 'TRAINING';
             document.getElementById('mode-indicator').classList.add('training');
             document.body.classList.add('is-training');
 
-            this.trainingInterval = setInterval(() => this.pollTraining(), 400);
+            const badge = document.getElementById('to-speed-badge');
+            if (badge) badge.style.display = this.highSpeed ? 'inline' : 'none';
+
+            // Poll more frequently in fast mode so UI stays responsive
+            const pollMs = this.highSpeed ? 200 : 400;
+            this.trainingInterval = setInterval(() => this.pollTraining(), pollMs);
         } catch(e) { console.error(e); }
     }
 
@@ -553,7 +609,7 @@ class WPARKSimulation {
                 sideProg.style.width = Math.round((data.current_individual / data.population_size) * 100) + '%';
             }
 
-            // Training overlay panel
+            // Overlay panel
             const ind = data.current_individual ?? 0;
             const tot = data.population_size   ?? 0;
             const pct = tot > 0 ? Math.round((ind / tot) * 100) : 0;
@@ -565,78 +621,185 @@ class WPARKSimulation {
             document.getElementById('to-eval').textContent     = tot ? `${ind} / ${tot}` : '—';
             document.getElementById('to-prog').style.width     = pct + '%';
             document.getElementById('to-prog-pct').textContent = pct;
-            const workers = data.parallel_workers;
-            document.getElementById('to-workers').textContent  = workers > 0 ? workers : '—';
+            document.getElementById('to-workers').textContent  = data.parallel_workers > 0 ? data.parallel_workers : '—';
+
+            // Keep speed badge in sync with what backend reports
+            const badge = document.getElementById('to-speed-badge');
+            if (badge) badge.style.display = data.fast_mode ? 'inline' : 'none';
 
             this._trainingTick++;
+
             if (this._trainingTick % 3 === 0) this.updateNN();
-            if (this._trainingTick % 5 === 0) await this.step();   // slower sim steps during training
+
+            // Step the live sim once per newly-completed evaluation so the
+            // animation advances at the same pace as the evaluation simulations.
+            const prevEvalCount = this._lastEvalCount ?? 0;
+            const newEvalCount  = ind + (data.generation * tot);   // monotonically rising
+            const evalsDone     = newEvalCount - prevEvalCount;
+            this._lastEvalCount = newEvalCount;
+
+            if (evalsDone > 0) {
+                // Cap at 3 steps per poll so we don't flood the backend.
+                const stepsToRun = Math.min(evalsDone, 3);
+                for (let i = 0; i < stepsToRun; i++) await this.step();
+            } else {
+                // Fallback: always step at least every 5 ticks so the map stays live.
+                if (this._trainingTick % 5 === 0) await this.step();
+            }
 
             if (data.fitness_history?.length) {
                 this.fitnessHistory = data.fitness_history;
                 this.drawFitnessGraph();
             }
 
+            // Fetch generation report periodically
+            if (this._trainingTick % 4 === 0) {
+                this.fetchGenerationReport();
+            }
+
+            // Backend signalled it stopped (e.g. finished all generations)
             if (!data.active && this.trainingActive) this._stopTrainingUI();
         } catch(e) { console.error(e); }
     }
 
     async stopTraining() {
+        // Immediately update UI so the button feels responsive
         this._stopTrainingUI();
-        fetch('/api/training/stop', { method: 'POST' }).catch(() => {});
+        // Signal backend — fire-and-forget is fine; stop_event exits the loop fast now
+        try {
+            await fetch('/api/training/stop', { method: 'POST' });
+        } catch(e) {}
     }
 
     _stopTrainingUI() {
         this.trainingActive = false;
         clearInterval(this.trainingInterval);
         this.trainingInterval = null;
+        this.animator.setSpeedScale(1.0);   // restore normal animation speed
 
         document.getElementById('btn-train-start').style.display = 'block';
         document.getElementById('btn-train-stop').style.display  = 'none';
-        document.getElementById('mode-indicator').textContent = 'SIMULATION';
+        document.getElementById('mode-indicator').textContent    = 'SIMULATION';
         document.getElementById('mode-indicator').classList.remove('training');
         document.body.classList.remove('is-training');
 
+        const badge = document.getElementById('to-speed-badge');
+        if (badge) badge.style.display = 'none';
+
         const prog = document.getElementById('train-progress');
         if (prog) prog.style.width = '0';
+
+        // Fetch any reports that completed before we stopped
+        this.fetchGenerationReport();
     }
 
     drawFitnessGraph() {
         const canvas = document.getElementById('fitness-canvas');
         const ctx    = canvas.getContext('2d');
         const W = canvas.width, H = canvas.height;
-
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, W, H);
-
         const hist = this.fitnessHistory;
         if (hist.length < 2) return;
-
         const mx = Math.max(...hist), mn = Math.min(...hist), rng = mx - mn || 1;
         const px = i => (i / (hist.length - 1)) * W;
         const py = v => 4 + (H - 8) * (1 - (v - mn) / rng);
-
-        // Grid
-        ctx.strokeStyle = 'rgba(255,136,0,0.08)';
-        ctx.lineWidth = 1;
-        for (let i = 0; i <= 3; i++) { const y = 4 + (H - 8) * (i / 3); ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-
-        // Fill
+        ctx.strokeStyle = 'rgba(255,136,0,0.08)'; ctx.lineWidth = 1;
+        for (let i = 0; i <= 3; i++) { const y = 4 + (H-8)*(i/3); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
         ctx.fillStyle = 'rgba(255,136,0,0.06)';
         ctx.beginPath(); ctx.moveTo(0, H);
-        hist.forEach((v, i) => ctx.lineTo(px(i), py(v)));
+        hist.forEach((v,i) => ctx.lineTo(px(i), py(v)));
         ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
-
-        // Line
         ctx.strokeStyle = '#ff8800'; ctx.lineWidth = 1.5;
         ctx.beginPath();
-        hist.forEach((v, i) => i === 0 ? ctx.moveTo(px(i), py(v)) : ctx.lineTo(px(i), py(v)));
+        hist.forEach((v,i) => i===0 ? ctx.moveTo(px(i),py(v)) : ctx.lineTo(px(i),py(v)));
         ctx.stroke();
-
-        // Latest value
         ctx.fillStyle = 'rgba(255,204,0,0.9)';
         ctx.font = '9px Space Mono, monospace';
-        ctx.fillText(hist[hist.length - 1].toFixed(1), 3, 11);
+        ctx.fillText(hist[hist.length-1].toFixed(1), 3, 11);
+    }
+
+    // ── Generation Report ─────────────────────────────────────────
+    async fetchGenerationReport() {
+        try {
+            const data = await (await fetch('/api/training/generation_report')).json();
+            if (this.activeTab === 'networks' && data.latest) {
+                this.renderNetworksTab(data.latest);
+            }
+            if (this.activeTab === 'report' && data.reports?.length) {
+                this.renderReportTab(data.reports);
+            }
+        } catch(e) { console.error(e); }
+    }
+
+    renderNetworksTab(report) {
+        const el = document.getElementById('networks-content');
+        if (!el) return;
+        el.innerHTML = `
+            <div class="networks-header">
+                <span>Generation ${report.generation}</span>
+                <span class="networks-pop">${report.individuals.length} networks</span>
+            </div>
+            <div class="networks-meta">
+                <span>Best: <strong>${report.best_fitness}</strong></span>
+                <span>Avg: <strong>${report.avg_fitness}</strong></span>
+            </div>
+            <div class="networks-table">
+                ${report.individuals.map(ind => `
+                    <div class="network-row ${ind.rank === 1 ? 'network-row-best' : ''}">
+                        <div class="net-rank">#${ind.rank}</div>
+                        <div class="net-score-wrap">
+                            <div class="net-score-bar">
+                                <div class="net-score-fill" style="width:${ind.score}%;background:${this._scoreColor(ind.score)}"></div>
+                            </div>
+                            <span class="net-score-val">${ind.score}<span class="net-score-unit">/100</span></span>
+                        </div>
+                        <div class="net-meta">
+                            <span class="net-fitness">${ind.fitness.toFixed(0)}</span>
+                            <span class="net-born">G${ind.generation_born}</span>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>`;
+    }
+
+    renderReportTab(reports) {
+        const el = document.getElementById('report-content');
+        if (!el) return;
+        el.innerHTML = [...reports].reverse().map(r => {
+            const topScore = r.individuals[0]?.score ?? 0;
+            return `
+            <div class="report-gen">
+                <div class="report-gen-header">
+                    <span class="report-gen-num">GEN ${r.generation}</span>
+                    <span class="report-gen-score" style="color:${this._scoreColor(topScore)}">${topScore}/100</span>
+                    <span class="report-gen-avg">avg ${r.avg_fitness}</span>
+                </div>
+                <div class="report-gen-bar">
+                    <div class="report-gen-fill" style="width:${topScore}%;background:${this._scoreColor(topScore)}"></div>
+                </div>
+                <div class="report-gen-grid">
+                    ${r.individuals.slice(0, 6).map(ind => `
+                        <div class="rg-cell" title="Fitness: ${ind.fitness} | Born: G${ind.generation_born}">
+                            <div class="rg-bar" style="height:${ind.score}%;background:${this._scoreColor(ind.score)}"></div>
+                            <div class="rg-rank">#${ind.rank}</div>
+                        </div>
+                    `).join('')}
+                </div>
+                <div class="report-gen-details">
+                    Top: ${r.individuals.slice(0,3).map(i => `<span class="rg-pill" style="background:${this._scoreColor(i.score)}">${i.score}</span>`).join(' ')}
+                    &nbsp;·&nbsp; ${r.individuals.length} networks evaluated
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    _scoreColor(score) {
+        if (score >= 80) return '#44ff66';
+        if (score >= 60) return '#aaee22';
+        if (score >= 40) return '#ff8800';
+        if (score >= 20) return '#ff6600';
+        return '#ff4444';
     }
 }
 

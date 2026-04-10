@@ -7,7 +7,7 @@ import os
 import json
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 
 # Add project root to path
@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.car_park import CarPark, BayType, BayStatus
 from src.models.vehicle import Vehicle, VehicleSize, VisitPurpose, MobilityLevel
 from src.simulation import SimulationEngine, ASSIGNMENT_STRATEGIES, get_nn_strategy, NeuralNetworkAssignmentStrategy
+from train_worker import evaluate_weights as _evaluate_weights, REFERENCE_SCORE as _REFERENCE_SCORE
 
 app = Flask(__name__)
 CORS(app)
@@ -243,6 +244,7 @@ def get_state():
         'arrivals_by_level': engine.stats.arrivals_by_level,
         'nn_assignments': engine.stats.nn_assignments,
         'nn_avg_confidence': engine.stats.nn_avg_confidence,
+        'avg_assignment_quality': engine.stats.avg_assignment_quality,
         'near_misses': engine.stats.near_misses,
     }
 
@@ -257,13 +259,36 @@ def get_state():
     }
     state['entry_queue'] = [vehicle_to_dict(v) for v, _ in engine.entry_queue]
 
+    # In-transit vehicles (reserved bay but still driving to it)
+    state['in_transit_vehicles'] = {
+        vid: {
+            'vehicle': vehicle_to_dict(info['vehicle']),
+            'bay_id': info['bay_id'],
+            'level': info['level'],
+        }
+        for vid, info in engine.in_transit.items()
+    }
+
     return jsonify(state)
 
 
 @app.route('/api/step', methods=['POST'])
 def step_simulation():
     """Advance simulation by one step."""
-    engine = get_engine()
+    # Check whether the training loop just completed a generation and wants a
+    # fresh simulation so the new best network is evaluated from a clean state.
+    reset_happened = False
+    with _training_lock:
+        if training_state.get('reset_pending', False):
+            training_state['reset_pending'] = False
+            reset_happened = True
+
+    if reset_happened:
+        engine = init_simulation()
+        engine.assignment_strategy = 'neural_network'
+    else:
+        engine = get_engine()
+
     # Support both JSON body and empty body
     if request.is_json:
         data = request.json or {}
@@ -315,7 +340,8 @@ def step_simulation():
     return jsonify({
         'success': True,
         'time': engine.current_time,
-        'animations': animations_to_return
+        'animations': animations_to_return,
+        'reset': reset_happened,
     })
 
 
@@ -400,6 +426,7 @@ def get_nn_state():
 # Training state — written by background thread, read by request handlers
 training_state = {
     'active': False,
+    'fast_mode': False,
     'trainer': None,
     'generation': 0,
     'best_fitness': 0.0,
@@ -408,90 +435,62 @@ training_state = {
     'current_individual': 0,   # how many individuals have finished this generation
     'population_size': 0,
     'parallel_workers': 0,     # how many are running right now
+    'generation_reports': [],  # per-generation per-network score reports
+    'reset_pending': False,    # signals /api/step to reset the live sim for the new generation
     '_stop_event': None,
     '_thread': None,
 }
 _training_lock = threading.Lock()
 
-# --- Per-individual full-day evaluation ---
-_DAY_STEPS     = 288    # 5-min steps × 288 = 24 h
-_DAY_STEP_SIZE = 5.0    # minutes per step
-_MAX_WORKERS   = 8      # parallel individuals
+# _MAX_WORKERS: use all available cores; capped at population size at runtime
+_MAX_WORKERS = os.cpu_count() or 4
 
 
-def _evaluate_individual(individual, stop_event):
+def _run_training_loop(stop_event, fast_mode: bool = False):
     """
-    Evaluate one individual over a full simulated day (24 h).
-    Each individual gets an isolated SimulationEngine with its own NN strategy
-    so evaluations can run truly in parallel.
-    """
-    if stop_event.is_set():
-        return 0.0
-
-    engine = SimulationEngine()
-    engine.assignment_strategy = 'neural_network'
-
-    # Attach a private NN strategy — avoids touching the global singleton
-    nn_strat = NeuralNetworkAssignmentStrategy()
-    nn_strat.network = individual.to_network()
-    engine._nn_strategy_override = nn_strat
-
-    for _ in range(_DAY_STEPS):
-        if stop_event.is_set():
-            break
-        engine.step(_DAY_STEP_SIZE)
-
-    stats = engine.stats
-    arrivals = max(stats.total_arrivals, 1)
-    denied_rate = stats.total_denied / arrivals
-
-    # Fitness: reward throughput, penalise denial, reward confidence + utilisation
-    score = (
-        stats.total_arrivals    *   5.0   +   # raw throughput
-        (1.0 - denied_rate)     * 200.0   +   # service rate (most important)
-        stats.nn_avg_confidence *  80.0   +   # decisive predictions
-        stats.peak_occupancy    *  50.0       # good utilisation
-    )
-    return max(score, 0.0)
-
-
-def _run_training_loop(stop_event):
-    """
-    Background thread.
+    Background training thread.
     Each generation:
-      1. Evaluate all individuals in parallel (one full simulated day each)
-      2. Evolve population (elitism + crossover + mutation)
-      3. Push best network to live simulation
+      1. Evaluate all individuals in parallel (realistic day sim each)
+      2. Build per-network score report
+      3. Evolve population (elitism + crossover + mutation)
+      4. Push best network to live simulation
     """
-    while not stop_event.is_set():
-        with _training_lock:
-            trainer = training_state['trainer']
-            if trainer is None:
-                break
-            population = list(trainer.population)
-            pop_size   = len(population)
+    # Use all available CPU cores — ProcessPoolExecutor bypasses the GIL so
+    # each worker truly runs in parallel (one core each).
+    n_workers = min(_MAX_WORKERS, 20)   # cap at 20 so we don't over-subscribe
 
-        with _training_lock:
-            training_state['population_size']    = pop_size
-            training_state['current_individual'] = 0
-            training_state['parallel_workers']   = 0
-
-        # ── Parallel evaluation ──────────────────────────────────────
-        completed = 0
-        futures   = {}
-        workers   = min(_MAX_WORKERS, pop_size)
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+    # Create the pool ONCE and reuse it across all generations to avoid the
+    # per-generation process-spawn overhead (~0.5 s per worker on Windows).
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        while not stop_event.is_set():
             with _training_lock:
-                training_state['parallel_workers'] = workers
+                trainer = training_state['trainer']
+                if trainer is None:
+                    break
+                population = list(trainer.population)
+                pop_size   = len(population)
+
+            with _training_lock:
+                training_state['population_size']    = pop_size
+                training_state['current_individual'] = 0
+                training_state['parallel_workers']   = min(n_workers, pop_size)
+
+            # ── Parallel evaluation ──────────────────────────────────────
+            completed = 0
+            futures   = {}
 
             for ind in population:
                 if stop_event.is_set():
                     break
-                f = executor.submit(_evaluate_individual, ind, stop_event)
+                # Pass weights (numpy array — picklable) to the worker process.
+                f = executor.submit(_evaluate_weights, ind.weights, fast_mode)
                 futures[f] = ind
 
             for f in as_completed(futures):
+                if stop_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
                 ind = futures[f]
                 try:
                     ind.fitness = f.result()
@@ -501,34 +500,75 @@ def _run_training_loop(stop_event):
                 with _training_lock:
                     training_state['current_individual'] = completed
 
-        with _training_lock:
-            training_state['parallel_workers'] = 0
+            with _training_lock:
+                training_state['parallel_workers'] = 0
 
-        if stop_event.is_set():
-            break
+            if stop_event.is_set():
+                break
 
-        # ── Evolve & publish stats ───────────────────────────────────
-        with _training_lock:
-            trainer.evolve_generation()
-            trainer.update_stats()
+            # ── Build per-network generation report (before evolution) ───
+            with _training_lock:
+                sorted_pop = sorted(population, key=lambda x: x.fitness, reverse=True)
+                next_gen   = training_state['generation'] + 1
+                pop_fitnesses = [ind.fitness for ind in population]
+                avg_fit    = sum(pop_fitnesses) / max(len(pop_fitnesses), 1)
 
-            training_state['generation']    = trainer.generation
-            training_state['best_fitness']  = float(trainer.stats.best_fitness)
-            training_state['fitness_history'].append(float(trainer.stats.best_fitness))
-            training_state['population_stats'] = {
-                'best':      float(trainer.stats.best_fitness),
-                'avg':       float(trainer.stats.avg_fitness),
-                'worst':     float(trainer.stats.worst_fitness),
-                'std':       float(trainer.stats.fitness_std),
-                'diversity': float(trainer.get_population_diversity()),
-            }
-            # Push best network into the live simulation
-            get_nn_strategy().network = trainer.get_best_network()
+                report = {
+                    'generation':    next_gen,
+                    'timestamp':     time.time(),
+                    'best_fitness':  round(sorted_pop[0].fitness if sorted_pop else 0.0, 1),
+                    'avg_fitness':   round(avg_fit, 1),
+                    'individuals': [
+                        {
+                            'rank':             rank + 1,
+                            'fitness':          round(ind.fitness, 1),
+                            'score':            max(1, min(100, round(ind.fitness / _REFERENCE_SCORE * 100))),
+                            'generation_born':  ind.generation,
+                            'mutation_rate':    round(getattr(ind, 'mutation_rate_used', 0.1), 3),
+                        }
+                        for rank, ind in enumerate(sorted_pop)
+                    ],
+                }
+                training_state['generation_reports'].append(report)
+                if len(training_state['generation_reports']) > 30:
+                    training_state['generation_reports'] = training_state['generation_reports'][-30:]
+
+            # ── Evolve & publish stats ───────────────────────────────────
+            with _training_lock:
+                trainer.evolve_generation()
+                trainer.update_stats()
+
+                training_state['generation']    = trainer.generation
+                training_state['best_fitness']  = float(trainer.stats.best_fitness)
+                training_state['fitness_history'].append(float(trainer.stats.best_fitness))
+                training_state['population_stats'] = {
+                    'best':      float(trainer.stats.best_fitness),
+                    'avg':       float(trainer.stats.avg_fitness),
+                    'worst':     float(trainer.stats.worst_fitness),
+                    'std':       float(trainer.stats.fitness_std),
+                    'diversity': float(trainer.get_population_diversity()),
+                }
+                # Push best network into the live simulation and schedule a
+                # fresh-sim reset so the UI shows the new generation from t=0.
+                get_nn_strategy().network = trainer.get_best_network()
+                training_state['reset_pending'] = True
 
     with _training_lock:
         training_state['active']             = False
         training_state['current_individual'] = 0
         training_state['parallel_workers']   = 0
+
+
+@app.route('/api/training/generation_report')
+def get_generation_report():
+    """Get per-network scores for each completed generation."""
+    with _training_lock:
+        reports = list(training_state.get('generation_reports', []))
+    return jsonify({
+        'reports':            reports[-10:],
+        'latest':             reports[-1] if reports else None,
+        'total_generations':  len(reports),
+    })
 
 
 @app.route('/api/training/start', methods=['POST'])
@@ -544,31 +584,38 @@ def start_training():
 
     data = request.json or {}
     config = GeneticConfig(
-        population_size=data.get('population_size', 20),
-        elite_count=data.get('elite_count', 3),
-        mutation_rate=data.get('mutation_rate', 0.1),
+        population_size=data.get('population_size', 30),
+        elite_count=data.get('elite_count', 4),
+        mutation_rate=data.get('mutation_rate', 0.15),
         crossover_rate=data.get('crossover_rate', 0.7)
     )
     trainer = GeneticTrainer(config)
     trainer.initialize_population()
 
+    fast_mode  = bool(data.get('fast_mode', False))
     stop_event = threading.Event()
-    thread = threading.Thread(target=_run_training_loop, args=(stop_event,), daemon=True)
+    thread = threading.Thread(
+        target=_run_training_loop, args=(stop_event, fast_mode), daemon=True
+    )
 
     with _training_lock:
-        training_state['trainer'] = trainer
-        training_state['active'] = True
-        training_state['generation'] = 0
-        training_state['best_fitness'] = 0.0
-        training_state['fitness_history'] = []
-        training_state['population_stats'] = {}
+        training_state['trainer']            = trainer
+        training_state['active']             = True
+        training_state['fast_mode']          = fast_mode
+        training_state['generation']         = 0
+        training_state['best_fitness']       = 0.0
+        training_state['fitness_history']    = []
+        training_state['population_stats']   = {}
         training_state['current_individual'] = 0
-        training_state['population_size'] = config.population_size
-        training_state['_stop_event'] = stop_event
-        training_state['_thread'] = thread
+        training_state['population_size']    = config.population_size
+        training_state['generation_reports'] = []
+        training_state['reset_pending']      = False
+        training_state['_stop_event']        = stop_event
+        training_state['_thread']            = thread
 
     thread.start()
-    return jsonify({'success': True, 'message': 'Training started'})
+    return jsonify({'success': True, 'message': 'Training started',
+                    'fast_mode': fast_mode})
 
 
 @app.route('/api/training/stop', methods=['POST'])
@@ -590,6 +637,7 @@ def training_status():
     with _training_lock:
         return jsonify({
             'active':             training_state['active'],
+            'fast_mode':          training_state['fast_mode'],
             'generation':         training_state['generation'],
             'best_fitness':       training_state['best_fitness'],
             'current_individual': training_state['current_individual'],

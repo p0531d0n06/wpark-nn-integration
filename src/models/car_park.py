@@ -119,7 +119,13 @@ class Level:
     def __post_init__(self):
         if not self.bays:
             self._generate_bays()
-    
+        self._rebuild_index()
+
+    def _rebuild_index(self):
+        """Build O(1) lookup structures after bays list is populated."""
+        self._bay_by_id: Dict[str, ParkingBay] = {b.id: b for b in self.bays}
+        self._available_ids: set = {b.id for b in self.bays if b.status == BayStatus.AVAILABLE}
+
     def _generate_bays(self):
         """Generate parking bays for this level with proper distances."""
         self.bays = []
@@ -196,33 +202,28 @@ class Level:
     
     @property
     def occupied_count(self) -> int:
-        return sum(1 for bay in self.bays if bay.status in (BayStatus.OCCUPIED, BayStatus.RESERVED))
-    
+        return len(self.bays) - len(self._available_ids)
+
     @property
     def available_count(self) -> int:
-        return sum(1 for bay in self.bays if bay.status == BayStatus.AVAILABLE)
-    
+        return len(self._available_ids)
+
     @property
     def occupancy_rate(self) -> float:
-        if self.capacity == 0:
-            return 0.0
-        return self.occupied_count / self.capacity
-    
-    def get_available_bays(self, bay_type: Optional[BayType] = None, 
+        cap = len(self.bays)
+        return 0.0 if cap == 0 else (cap - len(self._available_ids)) / cap
+
+    def get_available_bays(self, bay_type: Optional[BayType] = None,
                            min_size: Optional[BaySize] = None) -> List[ParkingBay]:
-        """Get list of available bays, optionally filtered."""
-        available = [b for b in self.bays if b.is_available]
-        
+        """Get list of available bays, optionally filtered. O(available) not O(total)."""
+        available = [self._bay_by_id[bid] for bid in self._available_ids]
         if bay_type:
             available = [b for b in available if b.bay_type == bay_type]
-        
         return available
-    
+
     def get_bay_by_id(self, bay_id: str) -> Optional[ParkingBay]:
-        """Find bay by ID."""
-        for bay in self.bays:
-            if bay.id == bay_id:
-                return bay
+        """Find bay by ID — O(1) dict lookup."""
+        return self._bay_by_id.get(bay_id)
         return None
 
 
@@ -245,6 +246,14 @@ class CarPark:
     def __post_init__(self):
         if not self.levels:
             self._generate_default_levels()
+        self._build_bay_map()
+
+    def _build_bay_map(self):
+        """Build an O(1) bay_id → Level mapping."""
+        self._bay_level_map: Dict[str, Level] = {}
+        for level in self.levels:
+            for bay in level.bays:
+                self._bay_level_map[bay.id] = level
     
     def _generate_default_levels(self):
         """Generate 3 default levels. Main entrance/exit on Level 1."""
@@ -332,11 +341,9 @@ class CarPark:
         return all_bays
     
     def find_bay(self, bay_id: str) -> Optional[ParkingBay]:
-        """Find a bay by ID across all levels."""
-        for level in self.levels:
-            bay = level.get_bay_by_id(bay_id)
-            if bay:
-                return bay
+        """Find a bay by ID — O(1) lookup via _bay_level_map."""
+        level = self._bay_level_map.get(bay_id)
+        return level._bay_by_id.get(bay_id) if level else None
         return None
     
     def assign_bay(self, vehicle_id: str, bay_id: str, timestamp: float) -> bool:
@@ -344,6 +351,8 @@ class CarPark:
         bay = self.find_bay(bay_id)
         if bay and bay.is_available:
             bay.occupy(vehicle_id, timestamp)
+            level = self._bay_level_map[bay_id]
+            level._available_ids.discard(bay_id)
             return True
         return False
 
@@ -353,6 +362,8 @@ class CarPark:
         if bay and bay.is_available:
             bay.status = BayStatus.RESERVED
             bay.occupied_by = vehicle_id
+            level = self._bay_level_map[bay_id]
+            level._available_ids.discard(bay_id)
             return True
         return False
 
@@ -361,10 +372,12 @@ class CarPark:
         bay = self.find_bay(bay_id)
         if bay and bay.status == BayStatus.RESERVED and bay.occupied_by == vehicle_id:
             bay.occupy(vehicle_id, timestamp)
+            # _available_ids already updated when reserved
             return True
-        # Fallback: just occupy it
         if bay and bay.is_available:
             bay.occupy(vehicle_id, timestamp)
+            level = self._bay_level_map[bay_id]
+            level._available_ids.discard(bay_id)
             return True
         return False
 
@@ -373,11 +386,14 @@ class CarPark:
         bay = self.find_bay(bay_id)
         if bay:
             bay.vacate()
+            level = self._bay_level_map[bay_id]
+            level._available_ids.add(bay_id)
             return True
         return False
-    
+
     def reset(self):
         """Reset all bays to available."""
         for level in self.levels:
             for bay in level.bays:
                 bay.vacate()
+            level._available_ids = set(level._bay_by_id.keys())

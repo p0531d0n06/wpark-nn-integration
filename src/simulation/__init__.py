@@ -37,6 +37,9 @@ class SimulationStats:
     nn_assignments: int = 0
     nn_avg_confidence: float = 0.0
 
+    # Per-assignment goodness-of-fit (0-1): how well each bay matched the vehicle
+    avg_assignment_quality: float = 0.0
+
     avg_entry_wait: float = 0.0       # average minutes spent in entry queue
     peak_entry_queue: int = 0          # max entry queue length
     congestion_events: int = 0         # times a vehicle had to queue at gate/ramp
@@ -362,6 +365,50 @@ class SimulationEngine:
             floor_list=self._floor_list
         )
     
+    def _compute_bay_fit(self, vehicle: Vehicle, bay, assigned_level: int) -> float:
+        """
+        0-1 score measuring how well this bay suits this specific vehicle.
+
+        Components (weighted sum):
+          - floor proximity  (0.35): assigned level vs vehicle's target floor
+          - type match       (0.40): correct bay type for vehicle's requirements;
+                                     penalises wasting special bays on standard vehicles
+          - lift proximity   (0.25): closeness to shop gate (scaled by visit purpose)
+        """
+        # Floor proximity
+        target = vehicle.target_floor if vehicle.target_floor is not None else 0
+        floor_score = max(0.0, 1.0 - abs(assigned_level - target) / 2.0)
+
+        # Bay type match
+        bt = bay.bay_type
+        if vehicle.requires_blue_badge:
+            type_score = 1.0 if bt == BayType.BLUE_BADGE   else 0.1
+        elif vehicle.requires_parent_child:
+            type_score = 1.0 if bt == BayType.PARENT_CHILD else 0.1
+        elif vehicle.requires_ev_charging:
+            type_score = 1.0 if bt == BayType.EV           else 0.1
+        elif bt == BayType.STANDARD:
+            type_score = 1.0   # standard car in standard bay — ideal
+        else:
+            type_score = 0.0   # standard car wasting a reserved special bay
+
+        # Lift/shop-gate proximity, weighted by visit purpose
+        # Distances on the grid run roughly 90–480 px; normalise by 500.
+        purpose_weight = {
+            'shopping':      1.0,
+            'dining':        0.9,
+            'quick_errand':  1.0,
+            'entertainment': 0.7,
+            'medical':       0.9,
+            'commute':       0.3,
+            'emergency':     0.8,
+        }.get(vehicle.purpose.value, 0.7)
+        raw_lift = max(0.0, 1.0 - bay.distance_to_lift / 500.0)
+        # Blend: high-purpose vehicles really want to be close; commuters don't mind
+        lift_score = raw_lift * purpose_weight + 0.5 * (1.0 - purpose_weight)
+
+        return floor_score * 0.35 + type_score * 0.40 + lift_score * 0.25
+
     def try_assign_parking(self, vehicle: Vehicle) -> bool:
         """Try to reserve a bay for a vehicle. Returns True if bay reserved."""
         # Support per-instance NN strategy override for isolated parallel training evaluation
@@ -399,6 +446,16 @@ class SimulationEngine:
                 if vehicle.assigned_level is not None:
                     self.stats.arrivals_by_level[vehicle.assigned_level] = \
                         self.stats.arrivals_by_level.get(vehicle.assigned_level, 0) + 1
+
+                # Track per-assignment goodness-of-fit
+                bay = self.car_park.find_bay(bay_id)
+                if bay is not None:
+                    fit = self._compute_bay_fit(vehicle, bay, vehicle.assigned_level or 0)
+                    n = self.stats.total_arrivals
+                    self.stats.avg_assignment_quality = (
+                        (self.stats.avg_assignment_quality * (n - 1) + fit) / n
+                    )
+
                 return True
         return False
     
@@ -590,9 +647,9 @@ class SimulationEngine:
         for vehicle_id in to_depart:
             self.process_departure(vehicle_id)
 
-        # Update peak occupancy
-        current_occupancy = self.car_park.overall_occupancy
-        self.stats.peak_occupancy = max(self.stats.peak_occupancy, current_occupancy)
+        # Update peak occupancy — track BAY COUNT, not ratio, so the fitness
+        # formula (min(peak_occupancy, 200) * 20) works as intended.
+        self.stats.peak_occupancy = max(self.stats.peak_occupancy, self.car_park.total_occupied)
     
     def get_state_summary(self) -> Dict:
         """Get current simulation state summary."""
