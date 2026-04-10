@@ -38,7 +38,10 @@ class NeuralNetwork:
     
     def __init__(self, hidden_sizes: List[int] = None):
         """Initialize network with random weights."""
-        self.hidden_sizes = hidden_sizes or [64, 32]
+        # [8, 6] → ~277 parameters total — tractable for GA.
+        # The original [64, 32] gave 3785 params which is far too large for
+        # evolutionary search (random perturbations almost never improve fitness).
+        self.hidden_sizes = hidden_sizes or [8, 6]
         
         # Total input for vehicle/context encoding
         self.input_size = self.VEHICLE_FEATURES + self.CONTEXT_FEATURES
@@ -164,8 +167,9 @@ class NeuralNetwork:
         type_onehot[type_idx] = 1
         features.extend(type_onehot)
         
-        # Distance to lift (normalized, assume max 100)
-        features.append(min(bay.distance_to_lift / 100.0, 1.0))
+        # Distance to lift — scoring function uses max 500, so normalize by 500
+        # (was /100 which caused all bays to saturate at 1.0, blinding the NN)
+        features.append(min(bay.distance_to_lift / 500.0, 1.0))
         
         # Level distance from target (normalized, max 3 floors)
         level_num = int(bay.level_id.split('_')[1]) if '_' in bay.level_id else 0
@@ -364,20 +368,20 @@ class NeuralNetworkAssignment:
                 self.last_prediction_info = {'error': 'No available bays'}
             return None
 
-        # Handle special requirements first
-        required_type = None
+        # Hard-filter by bay type before the NN makes any decision.
+        # Special vehicles must get their required bay; regular vehicles must not
+        # consume special bays.  This removes type matching from the NN's task so
+        # it can focus purely on floor proximity and lift proximity.
         if vehicle.requires_blue_badge:
-            required_type = BayType.BLUE_BADGE
+            filtered = [b for b in available_bays if b.bay_type == BayType.BLUE_BADGE]
         elif vehicle.requires_parent_child:
-            required_type = BayType.PARENT_CHILD
+            filtered = [b for b in available_bays if b.bay_type == BayType.PARENT_CHILD]
         elif vehicle.requires_ev_charging:
-            required_type = BayType.EV
-
-        # Filter by required type if needed
-        if required_type:
-            type_bays = [b for b in available_bays if b.bay_type == required_type]
-            if type_bays:
-                available_bays = type_bays
+            filtered = [b for b in available_bays if b.bay_type == BayType.EV]
+        else:
+            filtered = [b for b in available_bays if b.bay_type == BayType.STANDARD]
+        if filtered:
+            available_bays = filtered
 
         # Get prediction from network — skip activation storage in training mode
         best_bay_id, probs = self.network.predict(

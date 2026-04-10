@@ -16,7 +16,6 @@ class BayType(Enum):
 class BayStatus(Enum):
     AVAILABLE = "available"
     OCCUPIED = "occupied"
-    RESERVED = "reserved"
     MAINTENANCE = "maintenance"
 
 
@@ -69,8 +68,6 @@ class ParkingBay:
         """Get display color based on type and status."""
         if self.status == BayStatus.OCCUPIED:
             return "#FF6B6B"  # Red
-        elif self.status == BayStatus.RESERVED:
-            return "#FFD93D"  # Yellow
         elif self.status == BayStatus.MAINTENANCE:
             return "#6C757D"  # Grey
         elif self.bay_type == BayType.BLUE_BADGE:
@@ -356,28 +353,11 @@ class CarPark:
             return True
         return False
 
-    def reserve_bay(self, vehicle_id: str, bay_id: str) -> bool:
-        """Reserve a bay (vehicle in transit, not yet physically parked)."""
-        bay = self.find_bay(bay_id)
-        if bay and bay.is_available:
-            bay.status = BayStatus.RESERVED
-            bay.occupied_by = vehicle_id
-            level = self._bay_level_map[bay_id]
-            level._available_ids.discard(bay_id)
-            return True
-        return False
-
     def finalize_bay(self, vehicle_id: str, bay_id: str, timestamp: float) -> bool:
-        """Finalize bay occupation when vehicle arrives at its bay."""
+        """Update occupied_since timestamp when vehicle physically arrives at its bay."""
         bay = self.find_bay(bay_id)
-        if bay and bay.status == BayStatus.RESERVED and bay.occupied_by == vehicle_id:
-            bay.occupy(vehicle_id, timestamp)
-            # _available_ids already updated when reserved
-            return True
-        if bay and bay.is_available:
-            bay.occupy(vehicle_id, timestamp)
-            level = self._bay_level_map[bay_id]
-            level._available_ids.discard(bay_id)
+        if bay and bay.occupied_by == vehicle_id:
+            bay.occupied_since = timestamp
             return True
         return False
 

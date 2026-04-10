@@ -58,15 +58,20 @@ class WPARKSimulation {
 
     async init() {
         this.popup = document.getElementById('info-popup');
+        this.tour  = new Tour(this);
         this.bindEvents();
         await this.loadStrategies();
         await this.fetchState();
         this.render();
         this.startAnimLoop();
         this.updateNN();
+        if (!localStorage.getItem('wpark_tour_v2')) {
+            setTimeout(() => this.tour.start(), 800);
+        }
     }
 
     bindEvents() {
+        document.getElementById('btn-tour')?.addEventListener('click', () => this.tour.restart());
         document.getElementById('btn-step').addEventListener('click',  () => this.step());
         document.getElementById('btn-reset').addEventListener('click', () => this.reset());
         document.getElementById('btn-auto').addEventListener('click',  () => this.toggleAutoRun());
@@ -91,6 +96,10 @@ class WPARKSimulation {
         document.getElementById('sim-speed').addEventListener('input', e => {
             this.config.simSpeed = parseInt(e.target.value);
             document.getElementById('sim-speed-value').textContent = this.config.simSpeed;
+            // Sync animation movement speed with sim speed (speed 5 = normal = scale 1.0)
+            if (!this.trainingActive) {
+                this.animator.setSpeedScale(this.config.simSpeed / 5.0);
+            }
             // Restart auto-run interval at new rate if currently running
             if (this.autoRun) {
                 clearInterval(this.autoRunInterval);
@@ -144,8 +153,11 @@ class WPARKSimulation {
     // ── Simulation step ──────────────────────────────────────────
     async step() {
         try {
-            // During training use 5-min steps to match the evaluation granularity.
-            const timeDelta = this.trainingActive ? 5.0 : this.config.timeStep;
+            // Always use the user's configured time step for the live display.
+            // Training evaluation runs its own separate simulation at 5-min steps;
+            // coupling the display to that cadence caused 10+ simultaneous arrivals
+            // per step which broke the animation system.
+            const timeDelta = this.config.timeStep;
             const res = await fetch('/api/step', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -202,6 +214,7 @@ class WPARKSimulation {
         const btn = document.getElementById('btn-auto');
         if (this.autoRun) {
             btn.textContent = '⏸ PAUSE'; btn.classList.add('active');
+            this.animator.setSpeedScale(this.config.simSpeed / 5.0);
             this.autoRunInterval = setInterval(() => this.step(), this._stepIntervalMs());
         } else {
             btn.textContent = '▶ AUTO'; btn.classList.remove('active');
@@ -287,11 +300,33 @@ class WPARKSimulation {
 
     // ── Animation loop ───────────────────────────────────────────
     startAnimLoop() {
-        setInterval(() => {
-            if (!this.animQueue.length) return;
-            const batch = this.animQueue.splice(0, this.animQueue.length);
-            batch.forEach(a => this.playAnim(a));
-        }, 100);
+        // Recursive setTimeout so the release gap between cars always reflects
+        // the current simSpeed — at speed 5 cars are released every 150 ms, at
+        // speed 20 every ~37 ms, at speed 1 every 750 ms (realistic slow pace).
+        const tick = () => {
+            let delayMs;
+
+            if (this.trainingActive) {
+                // Training: fixed fast cadence, trim backlog, cap concurrency.
+                if (this.animQueue.length > 6) this.animQueue.splice(0, this.animQueue.length - 3);
+                if (this.animQueue.length && this.animator._active.size < 4) {
+                    this.playAnim(this.animQueue.shift());
+                }
+                delayMs = 80;
+            } else {
+                // Normal mode: release interval scales with simSpeed.
+                // Cap queue so very high speeds don't build an infinite backlog.
+                if (this.animQueue.length > 8) this.animQueue.splice(0, this.animQueue.length - 4);
+                if (this.animQueue.length) {
+                    this.playAnim(this.animQueue.shift());
+                }
+                // speed 5 → 150 ms, speed 20 → 37 ms, speed 1 → 750 ms
+                delayMs = Math.round(750 / this.config.simSpeed);
+            }
+
+            setTimeout(tick, delayMs);
+        };
+        setTimeout(tick, 150);
     }
 
     playAnim(anim) {
@@ -579,8 +614,10 @@ class WPARKSimulation {
             this.trainingActive  = true;
             this._trainingTick   = 0;
             this._lastEvalCount  = 0;
-            // Speed up animations to match the faster sim cadence during training.
-            this.animator.setSpeedScale(3.0);
+            // Speed up animations during training and disable proximity braking
+            // (braking locks up when many vehicles share the entry path at once).
+            this.animator.setSpeedScale(6.0);
+            this.animator.setTrainingMode(true);
             document.getElementById('btn-train-start').style.display = 'none';
             document.getElementById('btn-train-stop').style.display  = 'block';
             document.getElementById('mode-indicator').textContent    = 'TRAINING';
@@ -675,7 +712,9 @@ class WPARKSimulation {
         this.trainingActive = false;
         clearInterval(this.trainingInterval);
         this.trainingInterval = null;
-        this.animator.setSpeedScale(1.0);   // restore normal animation speed
+        // Restore animation speed to match the current slider position
+        this.animator.setSpeedScale(this.config.simSpeed / 5.0);
+        this.animator.setTrainingMode(false);
 
         document.getElementById('btn-train-start').style.display = 'block';
         document.getElementById('btn-train-stop').style.display  = 'none';
@@ -800,6 +839,193 @@ class WPARKSimulation {
         if (score >= 40) return '#ff8800';
         if (score >= 20) return '#ff6600';
         return '#ff4444';
+    }
+}
+
+// ── Welcome Tour ─────────────────────────────────────────────────────────────
+class Tour {
+    constructor(app) {
+        this.app      = app;
+        this._overlay = null;
+        this._card    = null;
+        this._step    = 0;
+        this._steps   = [
+            {
+                target:   '.header',
+                title:    'Welcome to WPARK',
+                body:     'WPARK simulates a multi-storey car park where vehicles arrive, get assigned bays, park, and leave. A neural network can learn to make smarter assignments over time.',
+                position: 'bottom',
+            },
+            {
+                target:   '#carpark-container',
+                title:    'The Car Park',
+                body:     'Each coloured circle is a vehicle. Bays are colour-coded by type — standard, blue badge, parent &amp; child, and EV. Click any bay or vehicle for details.',
+                position: 'left',
+            },
+            {
+                target:   '.control-group',
+                title:    'Simulation Controls',
+                body:     'Step the simulation manually, toggle AUTO for continuous running, or dial in the speed and time-step per tick. Arrival Rate controls how busy the car park is.',
+                position: 'right',
+            },
+            {
+                target:   '#strategy-select',
+                title:    'Assignment Strategy',
+                body:     'Choose how bays get assigned: <strong>Smart</strong> uses heuristics, <strong>Random</strong> is the baseline, and <strong>Neural Network</strong> uses the currently loaded NN weights.',
+                position: 'right',
+            },
+            {
+                target:   '.stats-grid',
+                title:    'Live Statistics',
+                body:     'Occupancy, arrivals, denials, and queue length update after every step. A low denial rate with high assignment quality is the training goal.',
+                position: 'right',
+            },
+            {
+                target:   '#btn-train-start',
+                title:    'Training the Neural Network',
+                body:     'Click <strong>Train NN</strong> to run a genetic algorithm. A population of networks evolves across generations — the best are kept, the rest mutate and recombine.',
+                position: 'left',
+            },
+            {
+                target:   '#nn-svg',
+                title:    'Neural Network Monitor',
+                body:     'Watch the network\'s internals live: node activations, layer outputs, and prediction confidence. The fitness graph below tracks improvement each generation.',
+                position: 'left',
+            },
+            {
+                target:   null,
+                title:    "You\'re all set!",
+                body:     'Press <strong>Step</strong> or <strong>Auto</strong> to start simulating. When you\'re ready, hit <strong>Train NN</strong> to watch the network learn. You can revisit this tour any time using the <strong>?</strong> button.',
+                position: 'center',
+            },
+        ];
+    }
+
+    start() {
+        if (this._overlay) return;
+        this._step = 0;
+        this._mount();
+        this._show();
+    }
+
+    restart() {
+        this._unmount();
+        this.start();
+    }
+
+    _mount() {
+        this._overlay = document.createElement('div');
+        this._overlay.className = 'tour-spot';
+        document.body.appendChild(this._overlay);
+
+        this._card = document.createElement('div');
+        this._card.className = 'tour-card';
+        document.body.appendChild(this._card);
+    }
+
+    _unmount() {
+        if (this._overlay) { this._overlay.remove(); this._overlay = null; }
+        if (this._card)    { this._card.remove();    this._card    = null; }
+    }
+
+    _show() {
+        const step  = this._steps[this._step];
+        const total = this._steps.length;
+        const isLast  = this._step === total - 1;
+        const isFirst = this._step === 0;
+
+        // Position spotlight
+        if (step.target) {
+            const el  = document.querySelector(step.target);
+            const pad = 8;
+            if (el) {
+                const r = el.getBoundingClientRect();
+                Object.assign(this._overlay.style, {
+                    left:   (r.left   - pad) + 'px',
+                    top:    (r.top    - pad) + 'px',
+                    width:  (r.width  + pad * 2) + 'px',
+                    height: (r.height + pad * 2) + 'px',
+                    borderRadius: '8px',
+                });
+            } else {
+                Object.assign(this._overlay.style, { left:'50%', top:'50%', width:'0', height:'0' });
+            }
+        } else {
+            Object.assign(this._overlay.style, { left:'50%', top:'50%', width:'0', height:'0' });
+        }
+
+        // Dots
+        const dots = Array.from({ length: total }, (_, i) =>
+            `<div class="tour-dot${i === this._step ? ' active' : ''}"></div>`
+        ).join('');
+
+        this._card.innerHTML = `
+            <div class="tour-title">${step.title}</div>
+            <div class="tour-body">${step.body}</div>
+            <div class="tour-footer">
+                <div class="tour-dots">${dots}</div>
+                <div class="tour-btns">
+                    ${!isFirst ? '<button class="tour-btn" id="tour-prev">Back</button>' : ''}
+                    ${isLast
+                        ? '<button class="tour-btn tour-btn-primary" id="tour-done">Finish</button>'
+                        : '<button class="tour-btn tour-btn-primary" id="tour-next">Next</button>'
+                    }
+                    <button class="tour-btn tour-btn-skip" id="tour-skip">Skip</button>
+                </div>
+            </div>`;
+
+        this._positionCard(step);
+
+        document.getElementById('tour-next')?.addEventListener('click', () => this._advance(1));
+        document.getElementById('tour-prev')?.addEventListener('click', () => this._advance(-1));
+        document.getElementById('tour-done')?.addEventListener('click', () => this._done());
+        document.getElementById('tour-skip')?.addEventListener('click', () => this._done());
+    }
+
+    _positionCard(step) {
+        const card = this._card;
+        const CARD_W = 300, CARD_H = 210;
+        const pad = 16;
+
+        if (!step.target || step.position === 'center') {
+            Object.assign(card.style, { left:'50%', top:'50%', transform:'translate(-50%,-50%)' });
+            return;
+        }
+
+        const el = document.querySelector(step.target);
+        if (!el) {
+            Object.assign(card.style, { left:'50%', top:'50%', transform:'translate(-50%,-50%)' });
+            return;
+        }
+
+        const r  = el.getBoundingClientRect();
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        card.style.transform = '';
+
+        if (step.position === 'right') {
+            card.style.left = (r.right + pad) + 'px';
+            card.style.top  = Math.min(r.top, vh - CARD_H - pad) + 'px';
+        } else if (step.position === 'left') {
+            card.style.left = Math.max(pad, r.left - CARD_W - pad) + 'px';
+            card.style.top  = Math.min(r.top, vh - CARD_H - pad) + 'px';
+        } else if (step.position === 'bottom') {
+            card.style.left = Math.min(r.left, vw - CARD_W - pad) + 'px';
+            card.style.top  = (r.bottom + pad) + 'px';
+        } else if (step.position === 'top') {
+            card.style.left = Math.min(r.left, vw - CARD_W - pad) + 'px';
+            card.style.top  = Math.max(pad, r.top - CARD_H - pad) + 'px';
+        }
+    }
+
+    _advance(dir) {
+        this._step = Math.max(0, Math.min(this._steps.length - 1, this._step + dir));
+        this._show();
+    }
+
+    _done() {
+        localStorage.setItem('wpark_tour_v2', '1');
+        this._unmount();
     }
 }
 

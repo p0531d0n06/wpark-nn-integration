@@ -133,8 +133,6 @@ def get_bay_color(bay) -> str:
     """Get bay display color."""
     if bay.status == BayStatus.OCCUPIED:
         return '#662200'  # Dark orange for occupied
-    elif bay.status == BayStatus.RESERVED:
-        return '#664400'
     elif bay.status == BayStatus.MAINTENANCE:
         return '#333333'
     elif bay.bay_type == BayType.BLUE_BADGE:
@@ -259,7 +257,7 @@ def get_state():
     }
     state['entry_queue'] = [vehicle_to_dict(v) for v, _ in engine.entry_queue]
 
-    # In-transit vehicles (reserved bay but still driving to it)
+    # In-transit vehicles (assigned bay, still driving to it)
     state['in_transit_vehicles'] = {
         vid: {
             'vehicle': vehicle_to_dict(info['vehicle']),
@@ -482,6 +480,12 @@ def _run_training_loop(stop_event, fast_mode: bool = False):
             for ind in population:
                 if stop_event.is_set():
                     break
+                if ind.evaluated:
+                    # Elite preserved from previous generation — skip re-evaluation
+                    completed += 1
+                    with _training_lock:
+                        training_state['current_individual'] = completed
+                    continue
                 # Pass weights (numpy array — picklable) to the worker process.
                 f = executor.submit(_evaluate_weights, ind.weights, fast_mode)
                 futures[f] = ind
@@ -494,6 +498,7 @@ def _run_training_loop(stop_event, fast_mode: bool = False):
                 ind = futures[f]
                 try:
                     ind.fitness = f.result()
+                    ind.evaluated = True
                 except Exception:
                     ind.fitness = 0.0
                 completed += 1
@@ -538,9 +543,18 @@ def _run_training_loop(stop_event, fast_mode: bool = False):
                 trainer.evolve_generation()
                 trainer.update_stats()
 
-                training_state['generation']    = trainer.generation
-                training_state['best_fitness']  = float(trainer.stats.best_fitness)
-                training_state['fitness_history'].append(float(trainer.stats.best_fitness))
+                # Partial restart if stuck — keeps top 2, reinitialises the rest
+                if trainer.stagnant_generations >= trainer.config.stagnation_patience:
+                    trainer.partial_restart(n_keep=2)
+
+                training_state['generation']   = trainer.generation
+                # Track all-time best so the graph is monotonically non-decreasing
+                all_time_best = max(
+                    training_state.get('best_fitness', 0.0),
+                    float(trainer.stats.best_fitness)
+                )
+                training_state['best_fitness'] = all_time_best
+                training_state['fitness_history'].append(all_time_best)
                 training_state['population_stats'] = {
                     'best':      float(trainer.stats.best_fitness),
                     'avg':       float(trainer.stats.avg_fitness),
@@ -583,11 +597,12 @@ def start_training():
         old_event.set()
 
     data = request.json or {}
+    _cfg = GeneticConfig()  # read defaults from dataclass
     config = GeneticConfig(
-        population_size=data.get('population_size', 30),
-        elite_count=data.get('elite_count', 4),
-        mutation_rate=data.get('mutation_rate', 0.15),
-        crossover_rate=data.get('crossover_rate', 0.7)
+        population_size=data.get('population_size', _cfg.population_size),
+        elite_count=data.get('elite_count', _cfg.elite_count),
+        mutation_rate=data.get('mutation_rate', _cfg.mutation_rate),
+        crossover_rate=data.get('crossover_rate', _cfg.crossover_rate),
     )
     trainer = GeneticTrainer(config)
     trainer.initialize_population()

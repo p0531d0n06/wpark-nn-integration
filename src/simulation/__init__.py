@@ -410,7 +410,7 @@ class SimulationEngine:
         return floor_score * 0.35 + type_score * 0.40 + lift_score * 0.25
 
     def try_assign_parking(self, vehicle: Vehicle) -> bool:
-        """Try to reserve a bay for a vehicle. Returns True if bay reserved."""
+        """Try to assign a bay for a vehicle. Returns True if bay assigned."""
         # Support per-instance NN strategy override for isolated parallel training evaluation
         if self.assignment_strategy == "neural_network" and hasattr(self, '_nn_strategy_override'):
             strategy = self._nn_strategy_override
@@ -432,7 +432,7 @@ class SimulationEngine:
             bay_id = strategy.assign(vehicle, self.car_park, self.shops, self._shop_floor_map)
 
         if bay_id:
-            if self.car_park.reserve_bay(vehicle.id, bay_id):
+            if self.car_park.assign_bay(vehicle.id, bay_id, self.current_time):
                 vehicle.assigned_bay_id = bay_id
                 try:
                     level_part = bay_id.split('_')[0]
@@ -520,7 +520,7 @@ class SimulationEngine:
         self._pending_animations = []
 
     def _enter_or_queue(self, vehicle: Vehicle):
-        """Vehicle has a reserved bay — either start transit or join entry queue."""
+        """Vehicle has an assigned bay — either start transit or join entry queue."""
         gate_occ = self.zone_occupancy.get('entry_gate', 0)
         gate_cap = self._zone_capacity.get('entry_gate', 3)
         if gate_occ < gate_cap:

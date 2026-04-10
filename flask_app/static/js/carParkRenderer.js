@@ -43,7 +43,6 @@ const BAY_COLOURS = {
     parent_child: { fill: '#0d0616', stroke: '#5e1f99' },
     ev:           { fill: '#041406', stroke: '#1a5e1a' },
     occupied:     { fill: '#190700', stroke: '#7a3010' },
-    reserved:     { fill: '#11100a', stroke: '#604e00' },
 };
 
 // ── ParkingPlanRenderer ──────────────────────────────────────────────
@@ -387,9 +386,7 @@ class ParkingPlanRenderer {
     _bay(bay, x, y, bayW, faceDown, vehicle) {
         const g    = this._el('g');
         const isOcc = bay.status === 'occupied';
-        const isRes = bay.status === 'reserved';
         const cols  = isOcc ? BAY_COLOURS.occupied :
-                      isRes ? BAY_COLOURS.reserved :
                       (BAY_COLOURS[bay.bay_type] || BAY_COLOURS.standard);
 
         // Bay rectangle
@@ -414,19 +411,6 @@ class ParkingPlanRenderer {
         accent.setAttribute('pointer-events', 'none');
         g.appendChild(accent);
 
-        // Reserved dashed border
-        if (isRes && bayW > 20) {
-            const dr = this._el('rect');
-            dr.setAttribute('x', x + 2); dr.setAttribute('y', y + 2);
-            dr.setAttribute('width', bayW - 4); dr.setAttribute('height', CPR.BAY_H - 4);
-            dr.setAttribute('fill', 'none');
-            dr.setAttribute('stroke', 'rgba(255,180,0,0.4)');
-            dr.setAttribute('stroke-width', '1');
-            dr.setAttribute('stroke-dasharray', '4,3');
-            dr.setAttribute('pointer-events', 'none');
-            g.appendChild(dr);
-        }
-
         // Bay number
         if (bayW > 22) {
             const numY = faceDown ? y + CPR.BAY_H - 6 : y + 11;
@@ -437,7 +421,7 @@ class ParkingPlanRenderer {
         }
 
         // Special bay icon
-        if (!isOcc && !isRes && bay.bay_type !== 'standard' && bayW > 26) {
+        if (!isOcc && bay.bay_type !== 'standard' && bayW > 26) {
             const icons = { blue_badge: '♿', parent_child: '👶', ev: '⚡' };
             const ic = icons[bay.bay_type];
             if (ic) {
@@ -751,12 +735,16 @@ class VehicleAnimator {
         this._onNearMiss    = null;
         this._nearMissCount = 0;
         this._speedScale    = 1.0;   // multiplied onto every vehicle's per-frame t increment
+        this._trainingMode  = false; // disables proximity braking during training
     }
 
     onNearMiss(fn) { this._onNearMiss = fn; }
 
     /** Set a global speed multiplier (1 = normal, >1 = faster animations). */
     setSpeedScale(scale) { this._speedScale = Math.max(0.1, scale); }
+
+    /** Disable proximity braking during training (many simultaneous vehicles lock each other). */
+    setTrainingMode(on) { this._trainingMode = !!on; }
 
     // ── Start an animation ────────────────────────────────────────
     start(vehicle, path, onDone) {
@@ -790,9 +778,8 @@ class VehicleAnimator {
             const a = path[i], b = path[i + 1] || a;
             return Math.hypot(b.x - a.x, b.y - a.y);
         };
-        const scale = this._speedScale;
-        // Slower base speed for smoother motion; scaled by _speedScale during training
-        const speedFor = dist => Math.max(0.006, Math.min(0.9, (48 / Math.max(dist, 1)) * scale));
+        // Always read _speedScale live so speed-slider changes take effect immediately
+        const speedFor = dist => Math.max(0.006, Math.min(0.9, (48 / Math.max(dist, 1)) * this._speedScale));
 
         const state = {
             dot, hl, glow, path,
@@ -820,17 +807,20 @@ class VehicleAnimator {
                 continue;
             }
 
+            // Recalculate speed every frame so speed-slider changes are instantaneous
+            {
+                const from = a.path[a.segIdx];
+                const to   = a.path[Math.min(a.segIdx + 1, a.path.length - 1)];
+                const dist = Math.hypot(to.x - from.x, to.y - from.y);
+                a.speed = Math.max(0.006, Math.min(0.9, (48 / Math.max(dist, 1)) * this._speedScale));
+            }
+
             // Cubic-eased progress
             a.t += a.speed;
             if (a.t >= 1) {
                 a.t = 0;
                 a.segIdx++;
                 if (a.segIdx >= a.path.length - 1) { a.done = true; continue; }
-                const dist = Math.hypot(
-                    a.path[a.segIdx + 1].x - a.path[a.segIdx].x,
-                    a.path[a.segIdx + 1].y - a.path[a.segIdx].y
-                );
-                a.speed = Math.max(0.006, Math.min(0.9, (48 / Math.max(dist, 1)) * this._speedScale));
             }
 
             const from = a.path[a.segIdx];
@@ -842,40 +832,45 @@ class VehicleAnimator {
         }
 
         // ── Proximity / near-miss ─────────────────────────────────
-        const SAFE_DIST  = 24;
-        const BRAKE_DIST = 14;
-        const entries = [...this._active.entries()].filter(([, a]) => !a.done);
+        // Skip during training: many simultaneous vehicles on shared entry paths
+        // cause the braking logic to clamp every car to near-zero speed, locking
+        // up the animation entirely.
+        if (!this._trainingMode) {
+            const SAFE_DIST  = 24;
+            const BRAKE_DIST = 14;
+            const entries = [...this._active.entries()].filter(([, a]) => !a.done);
 
-        for (let i = 0; i < entries.length; i++) {
-            for (let j = i + 1; j < entries.length; j++) {
-                const [, ai] = entries[i];
-                const [, aj] = entries[j];
-                if (ai.cx == null || aj.cx == null) continue;
+            for (let i = 0; i < entries.length; i++) {
+                for (let j = i + 1; j < entries.length; j++) {
+                    const [, ai] = entries[i];
+                    const [, aj] = entries[j];
+                    if (ai.cx == null || aj.cx == null) continue;
 
-                const dx   = ai.cx - aj.cx;
-                const dy   = ai.cy - aj.cy;
-                const dist = Math.sqrt(dx * dx + dy * dy);
+                    const dx   = ai.cx - aj.cx;
+                    const dy   = ai.cy - aj.cy;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
 
-                if (dist < SAFE_DIST) {
-                    const trailing = (ai.segIdx < aj.segIdx || (ai.segIdx === aj.segIdx && ai.t < aj.t)) ? ai : aj;
-                    const maxSpeed = Math.max(0.002, (dist / SAFE_DIST) * 0.035);
-                    trailing.speed = Math.min(trailing.speed, maxSpeed);
+                    if (dist < SAFE_DIST) {
+                        const trailing = (ai.segIdx < aj.segIdx || (ai.segIdx === aj.segIdx && ai.t < aj.t)) ? ai : aj;
+                        const maxSpeed = Math.max(0.002, (dist / SAFE_DIST) * 0.035);
+                        trailing.speed = Math.min(trailing.speed, maxSpeed);
 
-                    if (!trailing._braking) {
-                        trailing._braking = true;
-                        trailing.glow.setAttribute('fill', '#ff2200');
-                        trailing.glow.setAttribute('opacity', '0.45');
-                    }
-                    if (dist < BRAKE_DIST && !trailing._nearMissReported) {
-                        trailing._nearMissReported = true;
-                        if (this._onNearMiss) this._onNearMiss();
-                    }
-                } else {
-                    for (const [, a] of [entries[i], entries[j]]) {
-                        if (a._braking) {
-                            a._braking = false;
-                            a.glow.setAttribute('fill', a._origGlowColor);
-                            a.glow.setAttribute('opacity', '0.18');
+                        if (!trailing._braking) {
+                            trailing._braking = true;
+                            trailing.glow.setAttribute('fill', '#ff2200');
+                            trailing.glow.setAttribute('opacity', '0.45');
+                        }
+                        if (dist < BRAKE_DIST && !trailing._nearMissReported) {
+                            trailing._nearMissReported = true;
+                            if (this._onNearMiss) this._onNearMiss();
+                        }
+                    } else {
+                        for (const [, a] of [entries[i], entries[j]]) {
+                            if (a._braking) {
+                                a._braking = false;
+                                a.glow.setAttribute('fill', a._origGlowColor);
+                                a.glow.setAttribute('opacity', '0.18');
+                            }
                         }
                     }
                 }

@@ -16,7 +16,8 @@ class Individual:
     generation: int = 0
     weights: np.ndarray = field(default_factory=lambda: np.array([]))
     fitness: float = 0.0
-    
+    evaluated: bool = False   # True = fitness is valid, skip re-evaluation this generation
+
     # Training metadata
     parent_ids: Optional[Tuple[str, str]] = None
     mutation_rate_used: float = 0.0
@@ -37,13 +38,19 @@ class Individual:
             weights=network.get_weights_flat()
         )
     
-    def copy(self) -> 'Individual':
-        """Create a copy of this individual."""
+    def copy(self, carry_fitness: bool = False) -> 'Individual':
+        """Create a copy of this individual.
+
+        carry_fitness=True  → used for elite preservation: keep fitness + mark as
+                              already evaluated so the training loop skips re-scoring.
+        carry_fitness=False → used for offspring: reset fitness so they get a fresh eval.
+        """
         return Individual(
             id=str(uuid.uuid4())[:8],
             generation=self.generation,
             weights=self.weights.copy(),
-            fitness=self.fitness,
+            fitness=self.fitness if carry_fitness else 0.0,
+            evaluated=carry_fitness,
             parent_ids=self.parent_ids,
             mutation_rate_used=self.mutation_rate_used
         )
@@ -66,21 +73,24 @@ class TrainingStats:
 @dataclass
 class GeneticConfig:
     """Configuration for genetic algorithm."""
-    population_size: int = 50
-    elite_count: int = 5
-    mutation_rate: float = 0.15
-    mutation_strength: float = 0.3   # was 0.1 — bigger perturbations needed to escape plateaus
-    crossover_rate: float = 0.7
-    tournament_size: int = 5
+    population_size: int = 30
+    elite_count: int = 2             # minimal elitism — just protect the all-time best pair
+    mutation_rate: float = 0.2       # fraction of weights perturbed per individual
+    mutation_strength: float = 0.2   # gaussian σ — moderate steps for 277-param network
+    crossover_rate: float = 0.0      # disabled: crossover scrambles NN weights → only mutation
+    tournament_size: int = 3         # small tournament → more parent diversity
 
-    # Adaptive mutation
+    # Adaptive mutation — poor individuals explore harder, good ones exploit
     adaptive_mutation: bool = True
     mutation_rate_min: float = 0.05
     mutation_rate_max: float = 0.5
 
-    # Diversity maintenance — inject fresh random individuals when population collapses
-    diversity_threshold: float = 0.5   # reinject when avg pairwise distance falls below this
-    diversity_inject_frac: float = 0.3  # replace this fraction of the worst individuals
+    # Diversity maintenance
+    diversity_threshold: float = 4.0  # L2 norm trigger (weight distances typically 5–20)
+    diversity_inject_frac: float = 0.25
+
+    # Stagnation recovery — partial restart when no improvement for N generations
+    stagnation_patience: int = 12
 
 
 class GeneticTrainer:
@@ -92,7 +102,11 @@ class GeneticTrainer:
         self.generation: int = 0
         self.stats = TrainingStats()
         self.best_individual: Optional[Individual] = None
-        
+
+        # Stagnation tracking
+        self.stagnant_generations: int = 0
+        self._last_best_fitness: float = 0.0
+
         # Callbacks for UI updates
         self.on_generation_complete: Optional[Callable[[TrainingStats], None]] = None
         self.on_fitness_evaluated: Optional[Callable[[Individual], None]] = None
@@ -192,10 +206,10 @@ class GeneticTrainer:
         # Create new population
         new_population = []
 
-        # Keep elite unchanged
+        # Keep elite unchanged — preserve fitness so they aren't re-evaluated
         sorted_pop = sorted(self.population, key=lambda x: x.fitness, reverse=True)
         for ind in sorted_pop[:self.config.elite_count]:
-            elite = ind.copy()
+            elite = ind.copy(carry_fitness=True)
             elite.generation = self.generation + 1
             new_population.append(elite)
 
@@ -234,19 +248,43 @@ class GeneticTrainer:
     def update_stats(self):
         """Update training statistics."""
         fitnesses = [ind.fitness for ind in self.population]
-        
+
         self.stats.generation = self.generation
         self.stats.best_fitness = max(fitnesses)
         self.stats.avg_fitness = np.mean(fitnesses)
         self.stats.worst_fitness = min(fitnesses)
         self.stats.fitness_std = np.std(fitnesses)
         self.stats.fitness_history.append(self.stats.best_fitness)
-        
+
         # Track best individual
         best = max(self.population, key=lambda x: x.fitness)
         if self.best_individual is None or best.fitness > self.best_individual.fitness:
             self.best_individual = best.copy()
         self.stats.best_individual_id = self.best_individual.id
+
+        # Stagnation tracking (based on all-time best, not current gen)
+        all_time_best = self.best_individual.fitness if self.best_individual else 0.0
+        if all_time_best > self._last_best_fitness + 1e-6:
+            self._last_best_fitness = all_time_best
+            self.stagnant_generations = 0
+        else:
+            self.stagnant_generations += 1
+
+    def partial_restart(self, n_keep: int = 2):
+        """Partial restart: keep top n_keep elites, reinitialise the rest randomly.
+
+        Called when stagnant_generations >= config.stagnation_patience.  Keeps
+        the proven best weights so we never lose a good solution, while flooding
+        the population with fresh candidates that explore different regions.
+        """
+        sorted_pop = sorted(self.population, key=lambda x: x.fitness, reverse=True)
+        new_population = [ind.copy(carry_fitness=True) for ind in sorted_pop[:n_keep]]
+        while len(new_population) < self.config.population_size:
+            network = NeuralNetwork()
+            ind = Individual.from_network(network, generation=self.generation)
+            new_population.append(ind)
+        self.population = new_population
+        self.stagnant_generations = 0
     
     def get_best_network(self) -> NeuralNetwork:
         """Get the best neural network from the population."""
